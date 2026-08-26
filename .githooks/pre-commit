@@ -1,0 +1,38 @@
+#!/bin/sh
+# No absolute machine path in a committed file. The rule has one authority,
+# `ship.py check-paths`, and this runs it rather than keeping a second copy of
+# the regexes that would drift from it.
+#
+# This hook belongs to THIS repository and is never installed into a project:
+# core.hooksPath would override whatever hooks that project already had.
+# ship.py therefore sits beside it, at the top of the same tree.
+#
+# Reads the INDEX, not the working tree: what is about to be published is what is
+# staged, so a half-staged fix is judged by the half that ships. --no-verify
+# skips the hook.
+
+set -e
+
+repo=$(git rev-parse --show-toplevel)
+
+# Probed by RUNNING each candidate, not by `command -v`: on Windows a bare
+# `python` is often the Microsoft Store alias, which exists, prints an
+# advertisement and exits non-zero -- and the hook would read that as a refusal.
+for candidate in py python3 python; do
+	if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c "" >/dev/null 2>&1; then
+		py="$candidate"
+		break
+	fi
+done
+if [ -z "$py" ]; then
+	echo "pre-commit: no working python on PATH. Install it, or commit with --no-verify." >&2
+	exit 1
+fi
+
+if "$py" "$repo/ship.py" --project "$repo" check-paths; then
+	exit 0
+fi
+
+echo "" >&2
+echo "pre-commit: commit refused -- see the paths above." >&2
+exit 1
