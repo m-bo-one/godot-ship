@@ -9,7 +9,7 @@ and keep absolute machine paths out of the repository.
 Place this folder in your skills directory:
 
 ```
-git clone <this repo> ~/.claude/skills/godot-ship
+git clone git@github.com:m-bo-one/godot-ship.git ~/.claude/skills/godot-ship
 ```
 
 That is the whole installation. Nothing is copied into projects; `git pull` there
