@@ -6,6 +6,8 @@
     python build.py --debug windows     # debug build instead of release
     python build.py --list              # show what is installed, change nothing
     python build.py --project <project root> windows
+    python build.py web --preset "Web Playgama" --out build/playgama/web/index.html
+                                        # one named preset of that platform
 
 Nothing is hardcoded. The project root is found by walking up for
 `project.godot`; the engine comes from $GODOT / $GODOT_EXE / $GODOT_BIN, then
@@ -161,18 +163,40 @@ def have_template(folder: Path | None, prefix: str, debug: bool) -> bool:
     return any(p.name.startswith(f"{prefix}_{kind}") for p in folder.iterdir())
 
 
-def read_presets(cfg: Path) -> dict[str, str]:
-    """platform= -> name= for every preset in the file."""
+def _preset_blocks(cfg: Path) -> list[str]:
+    """Every [preset.N] block with its [preset.N.options], as text."""
     if not cfg.is_file():
-        return {}
+        return []
+    text = cfg.read_text(encoding="utf-8")
+    starts = list(re.finditer(r"^\[preset\.(\d+)\]$", text, flags=re.M))
+    return [text[m.start():(starts[i + 1].start() if i + 1 < len(starts) else len(text))]
+            for i, m in enumerate(starts)]
+
+
+def read_presets(cfg: Path) -> dict[str, str]:
+    """platform= -> name= for every preset in the file.
+
+    The FIRST preset of a platform wins. With two Web presets -- one per store --
+    this is only the fallback for a bare platform target; a named variant is
+    looked up by name with `preset_body`, never by platform.
+    """
     found = {}
-    for block in re.split(r"^\[preset\.\d+\]$", cfg.read_text(encoding="utf-8"),
-                          flags=re.M)[1:]:
+    for block in _preset_blocks(cfg):
         name = re.search(r'^name="([^"]*)"', block, flags=re.M)
         platform = re.search(r'^platform="([^"]*)"', block, flags=re.M)
         if name and platform:
-            found[platform.group(1)] = name.group(1)
+            found.setdefault(platform.group(1), name.group(1))
     return found
+
+
+def preset_body(cfg: Path, name: str | None) -> str | None:
+    """The block of the preset called `name`, or None when the file has none."""
+    if not name:
+        return None
+    for block in _preset_blocks(cfg):
+        if re.search(rf'^name="{re.escape(name)}"$', block, flags=re.M):
+            return block
+    return None
 
 
 def next_preset_index(cfg: Path) -> int:
@@ -264,6 +288,10 @@ def ensure_etc2_astc(root: Path) -> bool:
 
 
 def add_preset(cfg: Path, key: str, root: Path) -> str:
+    """Append the platform's default preset. Only that one: a NAMED preset of a
+    variant carries settings this generator knows nothing about -- a store's
+    HTML shell, its own exclude list -- so a missing one is an error to fix in
+    export_presets.cfg, not a block to invent."""
     platform, preset_name, path_template, _ = PLATFORMS[key]
     index = next_preset_index(cfg)
     export_path = path_template.format(name=artifact_name(root))
@@ -302,40 +330,28 @@ custom_template/release=""
     return preset_name
 
 
-def preset_export_path(cfg: Path, platform: str) -> str | None:
+def preset_export_path(cfg: Path, name: str | None) -> str | None:
     """The preset's own export_path, which wins over the generated name.
 
     The generated name is an ASCII slug of `config/name`, so a non-Latin project
     name lands on a different file than the preset declares. Windows hides that
     by being case-insensitive; macOS and Linux ship two artifacts instead.
     """
-    if not cfg.is_file():
+    body = preset_body(cfg, name)
+    if body is None:
         return None
-    text = cfg.read_text(encoding="utf-8")
-    blocks = list(re.finditer(r"^\[preset\.(\d+)\]$", text, flags=re.M))
-    for index, match in enumerate(blocks):
-        end = blocks[index + 1].start() if index + 1 < len(blocks) else len(text)
-        body = text[match.start():end]
-        if re.search(rf'^platform="{re.escape(platform)}"$', body, flags=re.M):
-            found = re.search(r'^export_path="([^"]+)"$', body, flags=re.M)
-            return found.group(1) if found and found.group(1).strip() else None
-    return None
+    found = re.search(r'^export_path="([^"]+)"$', body, flags=re.M)
+    return found.group(1) if found and found.group(1).strip() else None
 
 
-def encryption_state(cfg: Path, platform: str) -> tuple[bool, bool]:
-    """(encrypt_pck, has a custom template) for this platform's preset."""
-    if not cfg.is_file():
+def encryption_state(cfg: Path, name: str | None) -> tuple[bool, bool]:
+    """(encrypt_pck, has a custom template) for the preset called `name`."""
+    body = preset_body(cfg, name)
+    if body is None:
         return False, False
-    text = cfg.read_text(encoding="utf-8")
-    blocks = list(re.finditer(r"^\[preset\.(\d+)\]$", text, flags=re.M))
-    for index, match in enumerate(blocks):
-        end = blocks[index + 1].start() if index + 1 < len(blocks) else len(text)
-        body = text[match.start():end]
-        if re.search(rf'^platform="{re.escape(platform)}"$', body, flags=re.M):
-            encrypted = bool(re.search(r"^encrypt_pck=true$", body, flags=re.M))
-            custom = re.search(r'^custom_template/release="([^"]+)"$', body, flags=re.M)
-            return encrypted, bool(custom and Path(custom.group(1)).is_file())
-    return False, False
+    encrypted = bool(re.search(r"^encrypt_pck=true$", body, flags=re.M))
+    custom = re.search(r'^custom_template/release="([^"]+)"$', body, flags=re.M)
+    return encrypted, bool(custom and Path(custom.group(1)).is_file())
 
 
 def export(godot: str, root: Path, preset: str, out: Path, debug: bool) -> bool:
@@ -365,7 +381,16 @@ def main() -> int:
     parser.add_argument("--bump", choices=("major", "minor", "patch"),
                         help="raise config/version before exporting")
     parser.add_argument("--set-version", help="write config/version, e.g. 1.2.0")
+    # One named preset of one platform. ship.py drives every variant through
+    # these two, one process per export, so that project.godot can be stripped
+    # differently around each one.
+    parser.add_argument("--preset", help="export this preset (name= in export_presets.cfg) "
+                                         "instead of the platform's first one")
+    parser.add_argument("--out", help="export path, relative to the project; default: the "
+                                      "preset's own export_path")
     args = parser.parse_args()
+    if (args.preset or args.out) and len(args.targets) != 1:
+        parser.error("--preset/--out name one export: pass exactly one platform with them")
 
     root = Path(args.project).resolve() if args.project else find_project(Path.cwd().resolve())
     version = project_version(root)
@@ -384,7 +409,7 @@ def main() -> int:
     print(f"engine    {godot}  ({engine})")
     print(f"templates {folder if folder else 'NOT INSTALLED'}")
     for key, (platform, _, _, prefix) in PLATFORMS.items():
-        encrypted, custom = encryption_state(cfg, platform)
+        encrypted, custom = encryption_state(cfg, presets.get(platform))
         if custom:
             ready = "custom"
         else:
@@ -402,9 +427,18 @@ def main() -> int:
     targets = args.targets or list(PLATFORMS)
     failed = []
     for key in targets:
-        platform, _, path_template, prefix = PLATFORMS[key]
-        print(f"\n[{key}]")
-        encrypted, custom = encryption_state(cfg, platform)
+        platform, default_name, path_template, prefix = PLATFORMS[key]
+        print(f"\n[{key}]" + (f" {args.preset}" if args.preset else ""))
+        name = args.preset or presets.get(platform)
+        if name and preset_body(cfg, name) is None:
+            if name != default_name:
+                # A variant's preset carries what the generator cannot know; see add_preset.
+                print(f'  FAILED: no preset named "{name}" in export_presets.cfg -- add it '
+                      f"there (the {default_name} block is a starting point)")
+                failed.append(key)
+                continue
+            name = None
+        encrypted, custom = encryption_state(cfg, name)
         # A custom template stands in for the installed one, so a machine that
         # only ever builds its own templates needs nothing in the editor's folder.
         if not custom and not have_template(folder, prefix, args.debug):
@@ -424,8 +458,8 @@ def main() -> int:
             continue
         if encrypted:
             print("  encryption: on (custom template)")
-        name = presets.get(platform) or add_preset(cfg, key, root)
-        declared = preset_export_path(cfg, platform)
+        name = name or add_preset(cfg, key, root)
+        declared = args.out or preset_export_path(cfg, name)
         out = root / (declared or path_template.format(name=artifact_name(root)))
         if export(godot, root, name, out, args.debug):
             print(f"  OK  {out}  ({out.stat().st_size / 1048576:.1f} MB)")

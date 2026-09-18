@@ -15,9 +15,11 @@ py ~/.claude/skills/godot-ship/ship.py build
 |---|---|
 | Everything, checked | `ship.py build` |
 | One target | `ship.py build web` |
+| One named variant of a platform | `ship.py build playgama` — see **Variants** |
+| Playgama Bridge into the project | `ship.py playgama` — addon, autoload, plugin, its own preset |
 | Audit the setup, not just the pack | `ship.py review` |
 | What is installed and configured | `ship.py doctor` |
-| Open the web build | `ship.py serve` — it cannot run from disk |
+| Open a web build | `ship.py serve [target]` — it cannot run from disk |
 | What is actually inside the pack | `ship.py audit --check` |
 | Run the artifact and read its output | `ship.py boot` |
 | Machine paths about to be committed | `ship.py check-paths` |
@@ -106,15 +108,15 @@ exactly one computer, breaks every other checkout, and publishes a user name.
 The tracked preset keeps that field empty; `ship.py` writes the real path in for
 the length of the export and puts it back in a `finally`.
 
-`GODOT_SHIP_ENGINE`, `GODOT_TEMPLATE_<TARGET>` and `GODOT_SCRIPT_ENCRYPTION_KEY`
-override the local file, so CI needs no file at all. Note the order: the local
+`GODOT_SHIP_ENGINE`, `GODOT_TEMPLATE_<TARGET>` (a variant's name, then its
+platform) and `GODOT_SCRIPT_ENCRYPTION_KEY` override the local file, so CI needs no file at all. Note the order: the local
 config beats a bare `GODOT` or `GODOT_EXE`, which tend to be set machine-wide to
 whatever engine was installed last — a project pinned to one version must not be
 hijacked by that.
 
 **The keys are in the file, not here.** `ship.py init` writes both configs with a
 comment on every key, and the ones most projects do not need — `payload`,
-`archive`, `strip`, `obfuscation.scan`, `key` — are written out commented, with
+`archive`, `strip`, `variants`, `obfuscation.scan`, `key` — are written out commented, with
 what each decides. Read `godot-ship.yaml`; a second copy of the schema in this
 document would be a second copy to keep in step, and it would lose.
 
@@ -125,6 +127,71 @@ needs goes into `export_presets.cfg` by hand and stays there —
 `application/export_d3d12`, `application/modify_resources`, the icon, the file
 description. During an export ship.py touches exactly two things and puts both
 back: `custom_template/release` and the encryption flags.
+
+## Variants: two builds of one platform from one tree
+
+A store build that carries an SDK and a store build that must not — two web
+exports, one `project.godot`. `variants:` in `godot-ship.yaml` names them:
+
+```yaml
+targets: [windows, web, playgama]
+variants:
+  playgama:
+    platform: web                 # which platform it is an export of
+    preset: "Web Playgama"        # its own block in export_presets.cfg, by hand
+    out: build/playgama/web/index.html
+    archive: build/playgama/game-web.zip   # flat, index.html at the zip root
+    addon: playgama_bridge        # installed before the export when absent
+    strip:                        # REPLACES the top-level strip for this export
+      autoloads: ["QaDriver"]
+  web:                            # the plain build: the SDK held out of it
+    strip:
+      autoloads: ["QaDriver", "Bridge"]
+      plugins: ["res://addons/playgama_bridge/plugin.cfg"]
+```
+
+A target with no entry is the platform itself and builds exactly as before.
+What a variant changes, and why each rule is the way it is:
+
+- **One export per variant, `project.godot` rewritten around each.** A single
+  strip for the whole build would have to be the union of the lists, which
+  drops from every store's build what only one of them must not carry. Each
+  export strips its own list and puts the file back before the next.
+- **A variant's `strip` replaces, never merges.** Merging would make it
+  impossible for one variant to keep an autoload the others drop — the whole
+  reason the variant has a list.
+- **Its preset is found by name, never by platform.** With two Web presets in
+  the file, "the first Web one" is the other store's shell half the time. A
+  missing variant preset is an error, not a block to generate: it carries what
+  no generator knows — the store's HTML shell, its own exclude list.
+- **Both halves or neither, per variant.** `review` checks each variant's
+  strip list against its own preset's `exclude_filter`: an autoload kept while
+  its script is excluded fails (ERROR lines on the first frame); one dropped
+  while its files ship, or a plugin dropped while its autoload stays, warns —
+  the plugin re-registers the autoload the next time the editor loads.
+- **Template, key and `encrypt:` are read by variant name, then by platform**,
+  in the local file and in `GODOT_TEMPLATE_<NAME>` alike, so
+  `template: {web: …}` covers every web variant and one can still be pointed
+  at a template of its own.
+- **`archive:` on a variant** zips the export flat — `index.html` at the root
+  of the zip, Latin names only, `.import` sidecars and files an *earlier*
+  export left in the folder held out and named. That is what a store uploader
+  accepts, and the leftover-file rule exists because a build with the SDK held
+  out once shipped the SDK's `.js` from the export before it.
+- `audit`, `boot`, `serve` and `review` take a variant name where they take a
+  target; `boot` skips a web variant, `serve` defaults to `web` or the first
+  web variant. The obfuscation lock scan runs once per build — the tree is
+  the same for every variant of it.
+
+**Playgama.** `ship.py playgama` installs `addons/playgama_bridge` (from
+`playgama_bridge_src` in the local config — a checkout, the addon folder or
+the release zip — else the latest release of `Playgama/bridge-godot-4`, the
+Godot 4 line; `bridge-godot` without the suffix is the Godot 3 addon), puts
+the `Bridge` autoload *first* in `[autoload]` and the plugin in
+`[editor_plugins]`, and splits the Web preset in two: the plain one loses the
+Bridge shell and excludes `addons/playgama_bridge/*`, the new `"Web Playgama"`
+keeps the shell and the addon. Then it prints the `variants:` block to paste.
+Playgama's uploader wants exactly the flat zip above.
 
 ## Machine paths
 

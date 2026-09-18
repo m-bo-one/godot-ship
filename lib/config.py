@@ -11,6 +11,7 @@ at all.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import json
 import os
@@ -39,10 +40,24 @@ LOCAL = ".godot-ship.local.yaml"
 TRACKED_ALTS = ["godot-ship.yml", "godot-ship.json"]
 LOCAL_ALTS = [".godot-ship.local.yml", ".godot-ship.local.json"]
 
+# The three platforms an export can be for: CLI name -> (the `platform=` value
+# Godot writes in export_presets.cfg, the preset name the generator gives it, the
+# artifact path when no preset names one). lib/build.py carries the same three
+# rows and is not imported here on purpose -- it runs as its own process.
+PLATFORMS = {
+    "windows": ("Windows Desktop", "Windows Desktop", "build/{name}.exe"),
+    "macos": ("macOS", "macOS", "build/{name}.zip"),
+    "web": ("Web", "Web", "build/web/index.html"),
+}
+
 # Everything a project can leave unsaid. A game with no unusual needs ships with
 # a five-line godot-ship.json and inherits the rest.
 DEFAULTS = {
     "targets": ["windows"],
+    # Named export variants of one platform: two web builds from one tree, one
+    # per store, each with its own preset, output and strip list. A target with
+    # no entry here is the platform itself, exactly as it always was.
+    "variants": {},
     "encrypt": {},
     "obfuscate": False,
     # Where to look for symbols reached by string. "." is the whole project.
@@ -95,6 +110,30 @@ def outside_project(root: Path, candidate: str) -> bool:
         return False
 
 
+@dataclasses.dataclass(frozen=True)
+class Variant:
+    """One export: a platform, the preset it uses and what is held out of it.
+
+    `explicit` says whether godot-ship.yaml declared it under `variants:`. A
+    plain platform target keeps the older, looser preset lookup -- by name and
+    then by `platform=` -- because projects predating variants name their preset
+    whatever they like. A declared variant is found by name only: with two Web
+    presets in the file, "the first one whose platform is Web" is a coin toss.
+    """
+    name: str
+    platform: str          # windows | macos | web
+    preset: str            # name= in export_presets.cfg
+    out: str | None        # export path relative to the project, or the preset's own
+    strip: dict | None     # replaces the top-level `strip` for this export; None = inherit
+    archive: str | None    # a flat .zip of the export, relative to the project
+    addon: str | None      # an addon the export needs installed first (e.g. playgama_bridge)
+    explicit: bool
+
+    @property
+    def artifact(self) -> str:
+        return PLATFORMS[self.platform][2]
+
+
 class Config:
     def __init__(self, root: Path, tracked: dict, local: dict):
         self.root = root
@@ -114,7 +153,61 @@ class Config:
         return list(self.data["targets"])
 
     def encrypts(self, target: str) -> bool:
-        return bool(self.data["encrypt"].get(target, False))
+        """`encrypt:` is read by variant name first and by platform after, so a
+        map keyed by platform keeps covering every variant built on it."""
+        table = self.data["encrypt"] or {}
+        if target in table:
+            return bool(table[target])
+        platform = self.variant(target).platform
+        return bool(table.get(platform, False))
+
+    def variant(self, target: str) -> Variant:
+        """Resolve a target name: a declared variant, or a bare platform.
+
+        Anything else is refused here, before any file is touched: a misspelt
+        target that fell through to lib/build.py used to surface as argparse's
+        "invalid choice" after preflight had already run.
+        """
+        table = self.data.get("variants") or {}
+        entry = table.get(target)
+        if entry is None and target in PLATFORMS:
+            _, preset, _ = PLATFORMS[target]
+            return Variant(target, target, preset, None, None, None, None, explicit=False)
+        if entry is None:
+            known = ", ".join([*PLATFORMS, *table])
+            raise SystemExit(f"unknown target {target!r} -- not a platform and not declared "
+                             f"under `variants:` in {TRACKED}. Known: {known}")
+        if not isinstance(entry, dict):
+            raise SystemExit(f"variants.{target} in {TRACKED} must be a map, not {entry!r}")
+        platform = entry.get("platform") or (target if target in PLATFORMS else None)
+        if platform not in PLATFORMS:
+            raise SystemExit(f"variants.{target}.platform is {platform!r}; it must be one of "
+                             + ", ".join(PLATFORMS))
+        strip = entry.get("strip")
+        if strip is not None and not isinstance(strip, dict):
+            raise SystemExit(f"variants.{target}.strip must be a map with `autoloads` and/or "
+                             "`plugins` lists")
+        return Variant(
+            name=target,
+            platform=platform,
+            preset=str(entry.get("preset") or PLATFORMS[platform][1]),
+            out=str(entry["out"]) if entry.get("out") else None,
+            strip=strip,
+            archive=str(entry["archive"]) if entry.get("archive") else None,
+            addon=str(entry["addon"]) if entry.get("addon") else None,
+            explicit=True,
+        )
+
+    def variants(self, targets: list[str] | None = None) -> list[Variant]:
+        return [self.variant(t) for t in (targets if targets is not None else self.targets)]
+
+    def strip_for(self, variant: Variant) -> dict:
+        """The variant's own `strip` REPLACES the top-level one -- not merged.
+        Merging would make it impossible for one variant to keep an autoload the
+        others drop, which is the whole reason a variant has its own list."""
+        rules = variant.strip if variant.strip is not None else (self.data.get("strip") or {})
+        return {"autoloads": list(rules.get("autoloads") or []),
+                "plugins": list(rules.get("plugins") or [])}
 
     # -- local, never committed ---------------------------------------------
     def engine_candidates(self) -> list[tuple[str, str]]:
@@ -165,12 +258,24 @@ class Config:
 
         Never read from the tracked config: this is an absolute path on one
         machine, and writing it into export_presets.cfg is what the hook refuses.
+
+        Looked up by the variant's name and then by its platform, in both the
+        environment and the local file, so `template: {web: ...}` covers every
+        web variant and one of them can still be pointed at a template of its own.
         """
-        env = os.environ.get(f"GODOT_TEMPLATE_{target.upper()}")
-        if env and Path(env).is_file():
-            return env
-        found = (self.local.get("template") or {}).get(target)
-        return found if found and Path(found).is_file() else None
+        variant = self.variant(target)
+        names = [variant.name] if variant.name == variant.platform \
+            else [variant.name, variant.platform]
+        table = self.local.get("template") or {}
+        for name in names:
+            env = os.environ.get(f"GODOT_TEMPLATE_{name.upper()}")
+            if env and Path(env).is_file():
+                return env
+        for name in names:
+            found = table.get(name)
+            if found and Path(found).is_file():
+                return found
+        return None
 
     def key(self) -> str | None:
         env = os.environ.get("GODOT_SCRIPT_ENCRYPTION_KEY")

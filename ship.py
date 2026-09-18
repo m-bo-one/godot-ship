@@ -4,9 +4,10 @@
     py ship.py init                # set a project up: configs, .gitignore, hook
     py ship.py key                 # create the pack encryption key, once
     py ship.py doctor              # what is installed, configured and missing
-    py ship.py build               # every target in godot-ship.json
-    py ship.py build web           # one target
-    py ship.py serve               # open the web export over HTTP
+    py ship.py build               # every target in godot-ship.yaml
+    py ship.py build web           # one target, or one named variant: build playgama
+    py ship.py serve [target]      # open a web export over HTTP
+    py ship.py playgama            # install Playgama Bridge, register it, add its preset
     py ship.py audit               # what is actually inside the pack
     py ship.py boot                # run the exported artifact and read its output
     py ship.py check-paths         # machine paths about to be committed
@@ -37,6 +38,7 @@ from lib import audit as audit_lib      # noqa: E402
 from lib import config as config_lib    # noqa: E402
 from lib import gdmaim as gdmaim_lib    # noqa: E402
 from lib import paths as paths_lib      # noqa: E402
+from lib import playgama as playgama_lib  # noqa: E402
 from lib import review as review_lib    # noqa: E402
 from lib import rules                   # noqa: E402
 from lib import serve as serve_lib      # noqa: E402
@@ -53,11 +55,8 @@ GREEN, RED, YELLOW, CYAN, OFF = "\033[32m", "\033[31m", "\033[33m", "\033[36m", 
 if os.name == "nt":
     os.system("")  # turn on ANSI in a legacy console; harmless in a modern one
 
-ARTIFACT = {
-    "windows": "build/{name}.exe",
-    "macos": "build/{name}.zip",
-    "web": "build/web/index.html",
-}
+# Addons a variant can name under `addon:` and have installed before its export.
+ADDONS = {"playgama_bridge": playgama_lib}
 
 failures: list[str] = []
 
@@ -92,20 +91,57 @@ def artifact_name(root: Path) -> str:
 
 
 def artifact_path(cfg: config_lib.Config, target: str) -> Path:
-    """The preset's own export_path wins; the generated name is the fallback."""
+    """The variant's `out`, else its preset's own export_path, else the generated name."""
+    variant = cfg.variant(target)
+    if variant.out:
+        return _inside_project(cfg, variant.out)
     presets = cfg.root / "export_presets.cfg"
-    platform = {"windows": "Windows Desktop", "macos": "macOS", "web": "Web"}[target]
     if presets.is_file():
-        text = presets.read_text(encoding="utf-8")
-        blocks = list(re.finditer(r"^\[preset\.(\d+)\]$", text, flags=re.M))
-        for index, match in enumerate(blocks):
-            end = blocks[index + 1].start() if index + 1 < len(blocks) else len(text)
-            body = text[match.start():end]
-            if re.search(rf'^platform="{re.escape(platform)}"$', body, flags=re.M):
-                found = re.search(r'^export_path="([^"]+)"$', body, flags=re.M)
-                if found and found.group(1).strip():
-                    return _inside_project(cfg, found.group(1))
-    return cfg.root / ARTIFACT[target].format(name=artifact_name(cfg.root))
+        span = _preset_span(presets.read_text(encoding="utf-8"), variant)
+        if span:
+            found = re.search(r'^export_path="([^"]+)"$', span[2], flags=re.M)
+            if found and found.group(1).strip():
+                return _inside_project(cfg, found.group(1))
+    return cfg.root / variant.artifact.format(name=artifact_name(cfg.root))
+
+
+def _preset_span(text: str, variant: config_lib.Variant) -> tuple[int, int, str] | None:
+    """(start, end, body) of the variant's preset in export_presets.cfg.
+
+    By name. A bare platform target -- no `variants:` entry -- falls back to the
+    first preset of its platform, which is how a project from before variants
+    finds a preset it named however it liked. A declared variant never does:
+    with two Web presets in the file, "the first Web one" is the wrong one half
+    the time, and the export that follows writes the other store's shell.
+    """
+    blocks = list(re.finditer(r"^\[preset\.(\d+)\]$", text, flags=re.M))
+    spans = []
+    for index, match in enumerate(blocks):
+        end = blocks[index + 1].start() if index + 1 < len(blocks) else len(text)
+        spans.append((match.start(), end, text[match.start():end]))
+    for start, end, body in spans:
+        if re.search(rf'^name="{re.escape(variant.preset)}"$', body, flags=re.M):
+            return start, end, body
+    if variant.explicit:
+        return None
+    platform = config_lib.PLATFORMS[variant.platform][0]
+    for start, end, body in spans:
+        if re.search(rf'^platform="{re.escape(platform)}"$', body, flags=re.M):
+            return start, end, body
+    return None
+
+
+def _preset_name(cfg: config_lib.Config, variant: config_lib.Variant) -> str:
+    """What lib/build.py is told to export: the preset found for this variant,
+    or the platform's default name for it to generate."""
+    presets = cfg.root / "export_presets.cfg"
+    if presets.is_file():
+        span = _preset_span(presets.read_text(encoding="utf-8"), variant)
+        if span:
+            found = re.search(r'^name="([^"]*)"$', span[2], flags=re.M)
+            if found:
+                return found.group(1)
+    return variant.preset
 
 
 def _inside_project(cfg: config_lib.Config, declared: str) -> Path:
@@ -148,6 +184,7 @@ def template_carries_key(template: Path, key: str) -> bool:
 
 def preflight(cfg: config_lib.Config, targets: list[str]) -> str:
     step("Preflight")
+    cfg.variants(targets)     # an unknown target name stops here, before anything runs
     engine = cfg.engine
     if not engine:
         want = cfg.get("engine_version")
@@ -182,60 +219,62 @@ def preflight(cfg: config_lib.Config, targets: list[str]) -> str:
 
 # ------------------------------------------------------------------------ build
 
-def patch_presets(cfg: config_lib.Config, targets: list[str]) -> str | None:
-    """Write the machine's template paths into the preset for the length of the
-    export. They are absolute paths belonging to one computer; committed, they
-    break every other checkout and publish a user name. The tracked file keeps
-    custom_template/release empty and this puts it back."""
+def patch_presets(cfg: config_lib.Config, variant: config_lib.Variant) -> str | None:
+    """Write the machine's template path into this variant's preset for the
+    length of the export. It is an absolute path belonging to one computer;
+    committed, it breaks every other checkout and publishes a user name. The
+    tracked file keeps custom_template/release empty and this puts it back.
+
+    One preset per call: two variants of one platform are two presets, and each
+    export must find only its own rewritten."""
     presets = cfg.root / "export_presets.cfg"
     if not presets.is_file():
         return None
     original = presets.read_text(encoding="utf-8")
-    text = original
-    for target in targets:
-        template = cfg.template(target)
-        platform = {"windows": "Windows Desktop", "macos": "macOS", "web": "Web"}[target]
-        blocks = list(re.finditer(r"^\[preset\.(\d+)\]$", text, flags=re.M))
-        for index, match in enumerate(blocks):
-            end = blocks[index + 1].start() if index + 1 < len(blocks) else len(text)
-            body = text[match.start():end]
-            if not re.search(rf'^platform="{re.escape(platform)}"$', body, flags=re.M):
-                continue
-            if template:
-                body = re.sub(r'^custom_template/release=".*"$',
-                              f'custom_template/release="{Path(template).as_posix()}"',
-                              body, flags=re.M)
-            # godot-ship.yaml is the authority on whether a target encrypts, and
-            # the preset is where Godot reads it. Disagreeing silently means an
-            # export that looks encrypted in the config and is not in the file.
-            wanted = "true" if cfg.encrypts(target) else "false"
-            was = re.search(r"^encrypt_pck=(\w+)$", body, flags=re.M)
-            for key in ("encrypt_pck", "encrypt_directory"):
-                body = re.sub(rf"^{key}=\w+$", f"{key}={wanted}", body, flags=re.M)
-            if cfg.encrypts(target):
-                body = re.sub(r'^encryption_include_filters=".*"$',
-                              'encryption_include_filters="*"', body, flags=re.M)
-            if was and was.group(1) != wanted:
-                warn(f"{target}: the preset said encrypt_pck={was.group(1)} and the config says "
-                     f"{wanted} -- exporting as the config says; fix the preset")
-            text = text[:match.start()] + body + text[end:]
-            break
+    span = _preset_span(original, variant)
+    if span is None:
+        return None
+    start, end, body = span
+    target = variant.name
+    template = cfg.template(target)
+    if template:
+        body = re.sub(r'^custom_template/release=".*"$',
+                      f'custom_template/release="{Path(template).as_posix()}"',
+                      body, flags=re.M)
+    # godot-ship.yaml is the authority on whether a target encrypts, and
+    # the preset is where Godot reads it. Disagreeing silently means an
+    # export that looks encrypted in the config and is not in the file.
+    wanted = "true" if cfg.encrypts(target) else "false"
+    was = re.search(r"^encrypt_pck=(\w+)$", body, flags=re.M)
+    for key in ("encrypt_pck", "encrypt_directory"):
+        body = re.sub(rf"^{key}=\w+$", f"{key}={wanted}", body, flags=re.M)
+    if cfg.encrypts(target):
+        body = re.sub(r'^encryption_include_filters=".*"$',
+                      'encryption_include_filters="*"', body, flags=re.M)
+    if was and was.group(1) != wanted:
+        warn(f"{target}: the preset said encrypt_pck={was.group(1)} and the config says "
+             f"{wanted} -- exporting as the config says; fix the preset")
+    text = original[:start] + body + original[end:]
     if text != original:
         presets.write_text(text, encoding="utf-8")
     return original
 
 
-def strip_project(cfg: config_lib.Config) -> str | None:
-    """Take dev autoloads and editor plugins out for the length of the export.
+def strip_project(cfg: config_lib.Config, variant: config_lib.Variant) -> str | None:
+    """Take dev autoloads and editor plugins out for the length of ONE export.
 
     Both halves or neither: excluding an addon's files while its autoload stays
     in project.godot leaves an autoload pointing at nothing, and the player's
     first frame is three ERROR lines. Removing the autoload alone does not last
     either -- the plugin writes it back every time the editor loads.
+
+    Per variant, not per build: the store build that carries an SDK keeps its
+    autoload, the store build without the SDK drops it, and both come from one
+    project.godot -- so it is rewritten around each export and put back between.
     """
-    rules = cfg.get("strip") or {}
-    autoloads = rules.get("autoloads") or []
-    plugins = rules.get("plugins") or []
+    rules = cfg.strip_for(variant)
+    autoloads = rules["autoloads"]
+    plugins = rules["plugins"]
     if not autoloads and not plugins:
         return None
     manifest = cfg.root / "project.godot"
@@ -249,8 +288,31 @@ def strip_project(cfg: config_lib.Config) -> str | None:
     if text == original:
         return None
     manifest.write_text(text, encoding="utf-8")
-    ok(f"held out of this export: {', '.join(autoloads + plugins)}")
+    ok(f"held out of {variant.name}: {', '.join(autoloads + plugins)}")
     return original
+
+
+def ensure_addon(cfg: config_lib.Config, variant: config_lib.Variant) -> None:
+    """Install what the variant says it needs before exporting it.
+
+    A Playgama export with no Bridge addon in the tree exports cleanly: the
+    preset's HTML shell path points at nothing, Godot falls back to its own
+    shell, and the build loads on the store with no SDK -- no saves, no ads,
+    no error. So the addon is put in first, and said out loud.
+    """
+    if not variant.addon:
+        return
+    module = ADDONS.get(variant.addon)
+    if module is None:
+        fail(f"{variant.name}: addon {variant.addon!r} is not one this tool can install "
+             f"({', '.join(ADDONS)})")
+        return
+    if module.installed(cfg.root):
+        return
+    module.install(cfg.root, cfg.local.get(f"{variant.addon}_src"))
+    module.enable(cfg.root)
+    ok(f"{variant.name}: {module.ADDON} installed and registered; the preset is yours to check "
+       f"-- ship.py {variant.addon.split('_')[0]} does that")
 
 
 def carry_payload(cfg: config_lib.Config, engine: str, out: Path) -> None:
@@ -293,31 +355,74 @@ def archive(cfg: config_lib.Config, out: Path) -> None:
     a stray screenshot sitting beside the artifacts would ride along unnoticed.
     The source map is deliberately not in here -- it belongs BESIDE an archive
     handed over, never inside it."""
-    import zipfile
     manifest = cfg.root / "project.godot"
     version = re.search(r'^config/version="([^"]*)"', manifest.read_text(encoding="utf-8"),
                         flags=re.M) if manifest.is_file() else None
     stem = out.stem + (f"-{version.group(1)}" if version and version.group(1).strip() else "")
-    zip_path = out.parent / f"{stem}.zip"
+    _zip_flat(out.parent / f"{stem}.zip", _desktop_entries(out), "")
+
+
+def _desktop_entries(out: Path) -> list[Path]:
     entries = [out]
     pack = out.with_suffix(".pck")
     if pack.is_file():
         entries.append(pack)
-    entries += sorted(out.parent.glob("*.dll"))
+    return entries + sorted(out.parent.glob("*.dll"))
+
+
+def _zip_flat(zip_path: Path, entries: list[Path], label: str) -> None:
+    """Every entry at the root of the zip, by its own name and nothing else."""
+    import zipfile
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
     zip_path.unlink(missing_ok=True)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as handle:
         for entry in entries:
             handle.write(entry, entry.name)
     raw = sum(entry.stat().st_size for entry in entries)
-    ok(f"{zip_path.name}: {len(entries)} files, "
+    ok(f"{label}{zip_path.name}: {len(entries)} files, "
        f"{zip_path.stat().st_size / 1048576:.0f} MB from {raw / 1048576:.0f} MB")
+
+
+def archive_variant(cfg: config_lib.Config, variant: config_lib.Variant, out: Path,
+                    since: float) -> None:
+    """`archive:` on a variant -- the store's upload, at the path it names.
+
+    Flat, index.html at the root of the zip, Latin names only: Playgama's
+    uploader rejects a zip with a folder at the top or a non-ASCII entry, and
+    says so only after the upload. A web export is the whole folder minus two
+    kinds of stowaway -- the `.import` sidecars the editor writes beside the
+    exported icons, and files an EARLIER export left there, which is how a
+    build with the SDK held out still shipped the SDK's js. A desktop export is
+    the named entries, as `archive: true` has always packed them.
+    """
+    zip_path = _inside_project(cfg, variant.archive)
+    if variant.platform == "web":
+        folder = out.parent
+        fresh = [f for f in sorted(folder.iterdir())
+                 if f.is_file() and f.suffix != ".import" and f.resolve() != zip_path.resolve()]
+        stale = [f.name for f in fresh if f.stat().st_mtime < since - 5]
+        entries = [f for f in fresh if f.name not in stale]
+        if stale:
+            warn(f"{variant.name}: left out of the zip, from an earlier export: "
+                 + ", ".join(stale[:8]) + (" ..." if len(stale) > 8 else ""))
+    else:
+        entries = _desktop_entries(out)
+    foreign = [e.name for e in entries if not e.name.isascii()]
+    if foreign:
+        fail(f"{variant.name}: non-Latin file name(s) in the export, which the store's uploader "
+             f"refuses: {', '.join(foreign[:5])}")
+        return
+    _zip_flat(zip_path, entries, f"{variant.name}: ")
 
 
 def build(cfg: config_lib.Config, targets: list[str], debug: bool = False) -> None:
     engine = preflight(cfg, targets)
+    variants = cfg.variants(targets)
     if cfg.get("obfuscate"):
         # A new call site with no lock entry breaks in the exported build and
-        # nowhere else, so it stops the build rather than shipping.
+        # nowhere else, so it stops the build rather than shipping. Once per
+        # build: the scan reads the tree, and the tree is the same for every
+        # variant of it.
         obfuscate(cfg, check=True)
         if failures:
             verdict()
@@ -328,60 +433,21 @@ def build(cfg: config_lib.Config, targets: list[str], debug: bool = False) -> No
 
     step("Export")
     started = time.time()
-    # Inside the try, both of them: patch_presets has already rewritten
-    # export_presets.cfg by the time strip_project runs, and strip_project reads
-    # and writes project.godot -- either can raise. Outside, the `finally` that
-    # puts the files back would never run, stranding this machine's absolute
-    # template path in a tracked file, which is the one thing this tool exists
-    # to keep out of a commit.
-    restore = restore_project = None
     try:
-        restore = patch_presets(cfg, targets)
-        restore_project = strip_project(cfg)
-        cmd = [sys.executable, str(HERE / "lib" / "build.py"), "--project", str(cfg.root)]
-        if debug:
-            cmd.append("--debug")
-        cmd += targets
-        if subprocess.run(cmd).returncode != 0:
-            raise SystemExit("the export failed")
+        # One export per variant, and project.godot rewritten around each: the
+        # variants differ in what is held out of them, and a single strip for
+        # the whole build would have to be the union -- which drops from every
+        # store's build what only one of them must not carry.
+        for variant in variants:
+            _export(cfg, variant, debug)
     finally:
-        if restore is not None:
-            (cfg.root / "export_presets.cfg").write_text(restore, encoding="utf-8")
-        if restore_project is not None:
-            (cfg.root / "project.godot").write_text(restore_project, encoding="utf-8")
         os.environ.pop("GODOT_SCRIPT_ENCRYPTION_KEY", None)
 
     step("What came out")
-    for target in targets:
-        out = artifact_path(cfg, target)
-        if not out.exists():
-            fail(f"{target}: {out} was not produced")
-            continue
-        if target == "web":
-            missing = [f for f in ("index.js", "index.wasm", "index.pck")
-                       if not (out.parent / f).is_file()]
-            if missing:
-                fail(f"web build is missing {', '.join(missing)}")
-            else:
-                total = sum(f.stat().st_size for f in out.parent.iterdir() if f.is_file())
-                ok(f"web: {total / 1048576:.1f} MB, {len(list(out.parent.iterdir()))} files")
-                warn("index.html from disk fails with \"Failed to fetch\" -- open it with: py ship.py serve")
-            continue
-        pack = out.with_suffix(".pck")
-        if pack.is_file():
-            kb = pack.stat().st_size / 1024
-            floor = cfg["boot"]["min_pack_kb"]
-            # An encrypting export with no key in the environment still writes a
-            # pack: a header and nothing else. Size is the only cheap tell.
-            if kb < floor:
-                fail(f"the pack is {kb:.0f} KB, under {floor} -- the export ran without the encryption key")
-            else:
-                ok(f"{out.name} {out.stat().st_size / 1048576:.1f} MB + pack {kb:.0f} KB")
-        else:
-            ok(f"{out.name} {out.stat().st_size / 1048576:.1f} MB (pack embedded)")
-        carry_payload(cfg, engine, out)
+    for variant in variants:
+        _came_out(cfg, variant, engine, started)
 
-    desktop = [t for t in targets if t != "web"]
+    desktop = [v.name for v in variants if v.platform != "web"]
     if cfg.get("obfuscate") and not failures and desktop:
         _carry_source_map(cfg, desktop[0], started)
     if cfg.get("archive") and not failures and desktop:
@@ -390,6 +456,75 @@ def build(cfg: config_lib.Config, targets: list[str], debug: bool = False) -> No
     if not failures:
         boot(cfg)
     verdict()
+
+
+def _export(cfg: config_lib.Config, variant: config_lib.Variant, debug: bool) -> None:
+    """One preset, one process, the two tracked files put back afterwards."""
+    ensure_addon(cfg, variant)
+    if failures:
+        raise SystemExit(f"{variant.name}: cannot export -- " + "; ".join(failures))
+    # Inside the try, both of them: patch_presets has already rewritten
+    # export_presets.cfg by the time strip_project runs, and strip_project reads
+    # and writes project.godot -- either can raise. Outside, the `finally` that
+    # puts the files back would never run, stranding this machine's absolute
+    # template path in a tracked file, which is the one thing this tool exists
+    # to keep out of a commit.
+    restore = restore_project = None
+    try:
+        restore = patch_presets(cfg, variant)
+        restore_project = strip_project(cfg, variant)
+        cmd = [sys.executable, str(HERE / "lib" / "build.py"), "--project", str(cfg.root)]
+        if debug:
+            cmd.append("--debug")
+        if variant.explicit:
+            cmd += ["--preset", _preset_name(cfg, variant)]
+            if variant.out:
+                cmd += ["--out", variant.out]
+        cmd.append(variant.platform)
+        if subprocess.run(cmd).returncode != 0:
+            raise SystemExit("the export failed")
+    finally:
+        if restore is not None:
+            (cfg.root / "export_presets.cfg").write_text(restore, encoding="utf-8")
+        if restore_project is not None:
+            (cfg.root / "project.godot").write_text(restore_project, encoding="utf-8")
+
+
+def _came_out(cfg: config_lib.Config, variant: config_lib.Variant, engine: str,
+              since: float) -> None:
+    target = variant.name
+    out = artifact_path(cfg, target)
+    if not out.exists():
+        fail(f"{target}: {out} was not produced")
+        return
+    if variant.platform == "web":
+        missing = [f for f in ("index.js", "index.wasm", "index.pck")
+                   if not (out.parent / f).is_file()]
+        if missing:
+            fail(f"{target} build is missing {', '.join(missing)}")
+        else:
+            total = sum(f.stat().st_size for f in out.parent.iterdir() if f.is_file())
+            ok(f"{target}: {total / 1048576:.1f} MB, {len(list(out.parent.iterdir()))} files")
+            serve = "py ship.py serve" + (f" {target}" if variant.explicit else "")
+            warn(f"index.html from disk fails with \"Failed to fetch\" -- open it with: {serve}")
+        if variant.archive and not failures:
+            archive_variant(cfg, variant, out, since)
+        return
+    pack = out.with_suffix(".pck")
+    if pack.is_file():
+        kb = pack.stat().st_size / 1024
+        floor = cfg["boot"]["min_pack_kb"]
+        # An encrypting export with no key in the environment still writes a
+        # pack: a header and nothing else. Size is the only cheap tell.
+        if kb < floor:
+            fail(f"the pack is {kb:.0f} KB, under {floor} -- the export ran without the encryption key")
+        else:
+            ok(f"{out.name} {out.stat().st_size / 1048576:.1f} MB + pack {kb:.0f} KB")
+    else:
+        ok(f"{out.name} {out.stat().st_size / 1048576:.1f} MB (pack embedded)")
+    carry_payload(cfg, engine, out)
+    if variant.archive and not failures:
+        archive_variant(cfg, variant, out, since)
 
 
 # ------------------------------------------------------------------------- boot
@@ -401,6 +536,8 @@ def boot(cfg: config_lib.Config) -> None:
     target = settings.get("target")
     if not target or target not in cfg.targets:
         return
+    if cfg.variant(target).platform == "web":
+        return     # an index.html is nothing this machine can execute; `serve` is its boot
     exe = artifact_path(cfg, target)
     if not exe.is_file():
         return
@@ -484,25 +621,27 @@ def review(cfg: config_lib.Config) -> int:
     have_tracked, have_local = config_lib.which_files(root)
     ok(f"config: {have_tracked}") if have_tracked else fail("no godot-ship.yaml -- run: ship.py init")
     ok(f"machine: {have_local}") if have_local else warn("no local config; relying on environment")
-    for target in cfg.targets:
+    variants = cfg.variants()
+    spans = {v.name: _preset_span(preset_text, v) for v in variants}
+    for variant in variants:
+        target = variant.name
         if cfg.encrypts(target) and not cfg.template(target):
             fail(f"{target} encrypts with no custom template: the build cannot read its own pack")
         # The preset is where Godot reads it; the config is where the project
         # states it. Drift between them exports a build nobody asked for.
-        platform = {"windows": "Windows Desktop", "macos": "macOS", "web": "Web"}[target]
-        blocks = list(re.finditer(r"^\[preset\.(\d+)\]$", preset_text, flags=re.M))
-        for index, match in enumerate(blocks):
-            end = blocks[index + 1].start() if index + 1 < len(blocks) else len(preset_text)
-            body = preset_text[match.start():end]
-            if not re.search(rf'^platform="{re.escape(platform)}"$', body, flags=re.M):
-                continue
-            says = re.search(r"^encrypt_pck=(\w+)$", body, flags=re.M)
-            if says and (says.group(1) == "true") != cfg.encrypts(target):
-                fail(f"{target}: preset says encrypt_pck={says.group(1)}, config says "
-                     f"{str(cfg.encrypts(target)).lower()} -- make the preset agree")
-            break
-    if cfg.encrypts("web"):
-        fail("web must not encrypt: the key ships inside the .wasm the browser downloads")
+        span = spans[target]
+        if span is None:
+            if variant.explicit:
+                fail(f'{target}: no preset named "{variant.preset}" in export_presets.cfg -- '
+                     "a variant's preset is written by hand, it carries what no generator knows")
+            continue
+        says = re.search(r"^encrypt_pck=(\w+)$", span[2], flags=re.M)
+        if says and (says.group(1) == "true") != cfg.encrypts(target):
+            fail(f"{target}: preset says encrypt_pck={says.group(1)}, config says "
+                 f"{str(cfg.encrypts(target)).lower()} -- make the preset agree")
+    for name in sorted({"web", *(v.name for v in variants if v.platform == "web")}):
+        if cfg.encrypts(name):
+            fail(f"{name} must not encrypt: the key ships inside the .wasm the browser downloads")
     compute = review_lib.compute_shaders(root)
     if compute and "web" in cfg.targets:
         # A warning, not a refusal: the rest of the game may be exactly what the
@@ -541,7 +680,24 @@ def review(cfg: config_lib.Config) -> int:
         else:
             warn(f"{addon} carries an EditorPlugin and is NOT excluded -- editor code in a player's build")
 
+    # Both halves or neither, judged per export: each variant strips its own list
+    # against its own preset's exclude_filter. The forbidden list is judged once,
+    # for autoloads no export drops -- one that every export strips is handled.
+    stripped_everywhere = None
+    for variant in variants:
+        span = spans[variant.name]
+        exclude = re.search(r'^exclude_filter="([^"]*)"$', span[2], flags=re.M) if span else None
+        strip = cfg.strip_for(variant)
+        dropped = set(strip["autoloads"])
+        stripped_everywhere = dropped if stripped_everywhere is None else stripped_everywhere & dropped
+        bad, iffy = review_lib.halves(root, exclude.group(1) if exclude else "", strip)
+        for what in bad:
+            fail(f"{variant.name}: {what}")
+        for what in iffy:
+            warn(f"{variant.name}: {what}")
     for name, path in review_lib.autoloads(root):
+        if name in (stripped_everywhere or set()):
+            continue
         target = path.removeprefix("res://")
         if any(fnmatch.fnmatch(target, p) for p in cfg["audit"]["forbidden"]):
             fail(f"autoload {name} points at {target}, which is excluded -- "
@@ -555,9 +711,9 @@ def review(cfg: config_lib.Config) -> int:
     step("What the artifact gives away")
     key = cfg.key()
     checked = False
-    for target in cfg.targets:
-        out = artifact_path(cfg, target)
-        pack = out.parent / "index.pck" if target == "web" else out.with_suffix(".pck")
+    for variant in variants:
+        out = artifact_path(cfg, variant.name)
+        pack = out.parent / "index.pck" if variant.platform == "web" else out.with_suffix(".pck")
         for artifact, secret in ((pack, key), (out, None)):
             if not artifact.is_file():
                 continue
@@ -1071,6 +1227,21 @@ def _starter(version: str, seen: list[str], hygiene: list[str], required: list,
         '#   autoloads: ["MCPRuntimeProbe"]',
         '#   plugins: ["res://addons/godot_mcp/plugin.cfg"]',
         "#",
+        "# Two builds of one platform from one tree -- one per store -- each with its",
+        "# own preset, output and strip list. A variant's `strip` REPLACES the one",
+        "# above for that export. `ship.py playgama` sets the Bridge half of this up.",
+        "# variants:",
+        "#   playgama:",
+        "#     platform: web",
+        '#     preset: "Web Playgama"          # its own block in export_presets.cfg',
+        "#     out: build/playgama/web/index.html",
+        "#     archive: build/playgama/game-web.zip   # flat, index.html at the root",
+        "#     addon: playgama_bridge          # installed before the export when absent",
+        "#   web:                            # the plain web build: the SDK held out of it",
+        "#     strip:",
+        '#       autoloads: ["Bridge"]',
+        '#       plugins: ["res://addons/playgama_bridge/plugin.cfg"]',
+        "#",
         "# Where to look for symbols reached by string, when obfuscating. Default: all.",
         '# obfuscation: {scan: ["src", "addons/weather"]}',
         "#",
@@ -1114,6 +1285,7 @@ def _starter_local(candidates: list[tuple[Path, str]]) -> str:
         "  # EMPTY key and the build cannot read its own pack.",
         "",
         '# gdmaim_src: "<full path to a gdmaim checkout>"   # cloned from upstream when absent',
+        '# playgama_bridge_src: "<checkout, addon folder or release zip>"   # else the latest release is downloaded',
         "",
     ]
     return "\n".join(lines)
@@ -1209,7 +1381,8 @@ def _engine_candidates(want: str, root: Path) -> list[tuple[Path, str]]:
 
 def run_audit(cfg: config_lib.Config, target: str, everything: bool, checking: bool) -> int:
     out = artifact_path(cfg, target)
-    pack = out.parent / "index.pck" if target == "web" else out.with_suffix(".pck")
+    web = cfg.variant(target).platform == "web"
+    pack = out.parent / "index.pck" if web else out.with_suffix(".pck")
     source = pack if pack.is_file() else out
     if not source.is_file():
         raise SystemExit(f"nothing to audit at {source} -- build it first")
@@ -1230,6 +1403,34 @@ def run_audit(cfg: config_lib.Config, target: str, everything: bool, checking: b
     return 0
 
 
+def _web_target(cfg: config_lib.Config) -> str | None:
+    """`web` when the project builds it, else its first web variant, else None."""
+    if "web" in cfg.targets:
+        return "web"
+    return next((v.name for v in cfg.variants() if v.platform == "web"), None)
+
+
+def playgama(cfg: config_lib.Config) -> int:
+    """Put Playgama Bridge into the project: the addon, its autoload and plugin,
+    and a "Web Playgama" preset beside the plain Web one. Writes into the project."""
+    root = cfg.root
+    step("Playgama Bridge")
+    playgama_lib.install(root, cfg.local.get("playgama_bridge_src"))
+    playgama_lib.enable(root)
+    ok(f"{playgama_lib.ADDON} {playgama_lib.version(root)}: autoload Bridge and the plugin are registered")
+    variant = next((v for v in cfg.variants() if v.addon == "playgama_bridge"), None)
+    preset = variant.preset if variant else playgama_lib.PRESET
+    out = (variant.out if variant and variant.out else None) or playgama_lib.OUT
+    for line in playgama_lib.split_presets(root, preset, out):
+        ok(line)
+    if variant is None:
+        warn(f"no variant names addon: playgama_bridge in {config_lib.TRACKED} -- add this, "
+             "then `ship.py build playgama`:")
+        for line in playgama_lib.STARTER:
+            print(f"        {line}")
+    return 1 if failures else 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1242,7 +1443,8 @@ def main() -> int:
 
     sub.add_parser("doctor", help="report state, change nothing")
 
-    p = sub.add_parser("serve", help="serve the web export over HTTP")
+    p = sub.add_parser("serve", help="serve a web export over HTTP")
+    p.add_argument("target", nargs="?", help="a web target or variant (default: web)")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--dir")
 
@@ -1262,6 +1464,8 @@ def main() -> int:
 
     p = sub.add_parser("key", help="create the pack encryption key, once")
     p.add_argument("--force", action="store_true", help="replace an existing key (orphans old builds)")
+
+    sub.add_parser("playgama", help="install Playgama Bridge, register it, add its preset")
 
     p = sub.add_parser("obfuscate", help="install and configure GDMaim, keep its lock list")
     p.add_argument("--locks", action="store_true", help="regenerate the lock list")
@@ -1285,11 +1489,16 @@ def main() -> int:
         verdict()
         return 0
     if args.command == "serve":
-        folder = Path(args.dir) if args.dir else artifact_path(cfg, "web").parent
+        target = args.target or _web_target(cfg)
+        if not args.dir and not target:
+            raise SystemExit(f"no web target in {config_lib.TRACKED} -- name one, or pass --dir")
+        folder = Path(args.dir) if args.dir else artifact_path(cfg, target).parent
         return serve_lib.serve(folder, args.port)
     if args.command == "audit":
-        target = args.target or ("web" if "web" in cfg.targets else cfg.targets[0])
+        target = args.target or _web_target(cfg) or cfg.targets[0]
         return run_audit(cfg, target, args.all, args.check)
+    if args.command == "playgama":
+        return playgama(cfg)
     if args.command == "check-paths":
         return check_paths(cfg, staged=not args.tree)
     if args.command == "init":

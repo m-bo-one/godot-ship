@@ -45,10 +45,11 @@ py ~/.claude/skills/godot-ship/ship.py build
 
 | Command | What |
 |---|---|
-| `build [targets]` | export, verify, boot |
+| `build [targets]` | export, verify, boot — a target is a platform or a named variant of one |
+| `playgama` | put Playgama Bridge in: the addon, its autoload and plugin, its own web preset |
 | `review` | audit the setup: what is not covered, and what the artifacts give away |
 | `doctor` | engine, key, templates — what is missing |
-| `serve` | open the web build; it cannot run from disk |
+| `serve [target]` | open a web build; it cannot run from disk |
 | `audit --check` | what is actually inside the pack |
 | `boot` | run the artifact and read its output |
 | `obfuscate` | install and configure GDMaim, keep its lock list |
@@ -66,6 +67,15 @@ one in for the length of the export.
 
 Environment variables win over the local file, so CI needs no file at all:
 `GODOT_SHIP_ENGINE`, `GODOT_TEMPLATE_WINDOWS`, `GODOT_SCRIPT_ENCRYPTION_KEY`.
+
+## Two builds of one platform
+
+One tree, two web builds — one for a store whose SDK must be in, one for a
+store where it must be out. `variants:` in `godot-ship.yaml` names each with
+its own preset, output folder, strip list and optional flat `.zip`;
+`project.godot` is rewritten around each export and put back between. A
+target without an entry builds exactly as before. `ship.py playgama` sets the
+Playgama half of that up. Details are in [SKILL.md](SKILL.md#variants-two-builds-of-one-platform-from-one-tree).
 
 ## What it knows
 

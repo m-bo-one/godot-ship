@@ -92,6 +92,49 @@ def autoloads(root: Path) -> list[tuple[str, str]]:
     return found
 
 
+def excluded(path: str, exclude_filter: str) -> bool:
+    """Does the preset's exclude_filter drop this res:// path? Godot strips the
+    scheme and glob-matches each comma-separated pattern, `*` crossing `/`."""
+    bare = path.removeprefix("res://")
+    return any(fnmatch.fnmatch(bare, pattern.strip())
+               for pattern in exclude_filter.split(",") if pattern.strip())
+
+
+def halves(root: Path, exclude_filter: str, strip: dict) -> tuple[list[str], list[str]]:
+    """(fails, warnings) for one export: both halves of a dev addon or neither.
+
+    The failure: an autoload this export keeps whose script its preset excludes.
+    The pack has no script at that path, the autoload survives in project.godot,
+    and a player's first frame is three ERROR lines. The warning is the reverse:
+    an autoload this export drops whose files still ship -- dead weight rather
+    than a broken start, but the addon's code is in a stranger's build for
+    nothing -- and a plugin dropped from `[editor_plugins]` while its autoload
+    stays, which the plugin puts straight back when the editor next loads.
+    """
+    fails: list[str] = []
+    warnings: list[str] = []
+    dropped = set(strip.get("autoloads") or [])
+    plugins = [p.removeprefix("res://") for p in strip.get("plugins") or []]
+    for name, path in autoloads(root):
+        bare = path.removeprefix("res://")
+        if name in dropped and not excluded(path, exclude_filter):
+            warnings.append(f"strips autoload {name} but its preset does not exclude {bare} -- "
+                            "the script ships without the autoload that used it")
+        elif name not in dropped and excluded(path, exclude_filter):
+            fails.append(f"keeps autoload {name} while its preset excludes {bare} -- "
+                         "the autoload survives in project.godot pointing at nothing, and "
+                         "the first frame is ERROR lines. Add it to this export's strip.autoloads")
+        # A plugin is dropped so the export runs without it; the autoload the
+        # plugin registers has to go in the same breath, or the plugin's own
+        # _enter_tree writes it back the next time the editor loads the project.
+        folder = str(Path(bare).parent.as_posix())
+        for plugin in plugins:
+            if name not in dropped and Path(plugin).parent.as_posix() == folder:
+                warnings.append(f"strips plugin {plugin} and keeps its autoload {name} -- "
+                                "the plugin re-registers it on the next editor load")
+    return fails, warnings
+
+
 def leaks(artifact: Path, key: str | None) -> tuple[list[tuple[str, int]], list[str]]:
     """(hard findings, remarks) for what is readable in the artifact.
 

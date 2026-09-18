@@ -17,9 +17,13 @@ would name one project or one computer belongs in the config files `ship.py init
 
 ## Running it
 
-There is no build step, no dependency install and no test suite. Standard library only, Python
-3.9+; PyYAML is used when it happens to be installed and never required ([lib/yamlish.py](lib/yamlish.py)
-is why).
+There is no build step and no dependency install. Standard library only, Python 3.9+; PyYAML is
+used when it happens to be installed and never required ([lib/yamlish.py](lib/yamlish.py) is why).
+The unit tests need no Godot and no project -- they fake the exporter subprocess:
+
+```
+py -m unittest discover -s tests
+```
 
 Exercise changes against a real Godot project, from anywhere:
 
@@ -33,8 +37,8 @@ py ship.py --project <godot project> build [windows|macos|web]
 
 Every command takes `--project`; without it the CWD is walked upwards for `project.godot`.
 `review` and `check-paths` work outside a Godot project too. `init`, `key`, `obfuscate`,
-`templates` and `build` **write into the target project** — `doctor`, `review`, `audit` and
-`check-paths` never do.
+`playgama`, `templates` and `build` **write into the target project** — `doctor`, `review`,
+`audit` and `check-paths` never do.
 
 ## Architecture
 
@@ -49,6 +53,7 @@ project. `lib/` is analysis and pure helpers:
 | [lib/review.py](lib/review.py) | read-only judgement: uncovered entries, editor addons, autoloads, what an artifact leaks |
 | [lib/paths.py](lib/paths.py) | the machine-path scanner; reads the git **index**, not the working tree |
 | [lib/gdmaim.py](lib/gdmaim.py) | GDMaim install, its settled settings, the string-reached-symbol lock scan |
+| [lib/playgama.py](lib/playgama.py) | Playgama Bridge install, its autoload/plugin registration, the two-preset split |
 | [lib/build.py](lib/build.py), [lib/build_templates.py](lib/build_templates.py) | the exporter and the scons template build |
 | [lib/yamlish.py](lib/yamlish.py) | the YAML subset the configs are written in |
 
@@ -104,7 +109,14 @@ it into an exit code. A new check calls `fail()` and lets the verdict decide; it
    repository.
 9. **The preset generator writes only what an export fails without** (`PRESET_OPTIONS` in
    [lib/build.py](lib/build.py)). Everything else stays in the project's own
-   `export_presets.cfg`, by hand.
+   `export_presets.cfg`, by hand. A *variant's* preset is never generated at all.
+10. **A target is a `Variant`** (`Config.variant()` in [lib/config.py](lib/config.py)): a platform
+    plus a preset name, output, strip list and archive. `ship.py` never asks "is target == web";
+    it asks `variant.platform`. Presets are found **by name** (`_preset_span`); only a bare
+    platform target falls back to "the first preset of that platform", for projects from before
+    variants. Each variant is one `lib/build.py` process with `--preset`/`--out`, and
+    `project.godot` is stripped and restored around *each* one -- a variant's `strip` replaces
+    the top-level one, never merges with it.
 
 ## House style
 
