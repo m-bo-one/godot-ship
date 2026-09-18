@@ -81,6 +81,18 @@ REACHED = re.compile(
 CALLABLE = re.compile(r"Callable\([^,()]+,\s*&?\"(\w+)\"")
 DECLARED = re.compile(r"(?m)^\s*(?:@\w+(?:\([^)]*\))?\s+)*(?:static\s+)?func\s+(\w+)\s*\(")
 SIGNAL = re.compile(r"(?m)^\s*signal\s+(\w+)")
+# A *property* named in a string. Only the shapes a Dictionary does not share: bare `get`/`set`
+# would drag in every `row.get("id")` key that happens to match a member -- measured at 70 extra
+# locks on one project -- so those stay manual. First path segment only: "modulate:a" is `modulate`.
+PROPERTY = re.compile(
+    r"(?:\.|(?<![A-Za-z0-9_]))"
+    r"(?:tween_property|tween_method|set_deferred|get_indexed|set_indexed)"
+    r"\(\s*[^,()]*,?\s*&?\"([A-Za-z_]\w*)(?::[\w:]+)?\"")
+# ...and what declares one. Without this a `var` reached by string can never be found: the old
+# scan intersected with `func`/`signal` alone, so a tweened property was invisible by construction.
+DECLARED_VAR = re.compile(r"(?m)^\s*(?:@\w+(?:\([^)]*\))?\s+)*(?:static\s+)?var\s+(\w+)")
+# Everything below this line in the lock list is a human's, and regeneration re-emits it verbatim.
+MANUAL_MARK = "# --- MANUAL: kept across regeneration. Add the call site with the name. ---"
 
 
 def installed(root: Path) -> bool:
@@ -94,19 +106,27 @@ def install(root: Path, source: str | None) -> None:
         print("  addons/gdmaim already there")
         return
     target.parent.mkdir(parents=True, exist_ok=True)
+    # The folder usually exists already: a project tracks the addon's export.cfg and
+    # ignore_tokens.txt while gitignoring the addon itself, so a fresh worktree has
+    # `addons/gdmaim/` with no plugin.cfg in it and copytree onto it raised
+    # FileExistsError -- in exactly the situation the message said to run this.
+    # dirs_exist_ok makes copytree OVERWRITE, so the project's own settings and lock
+    # list are kept out of the copy: a source tree carrying its own export.cfg or
+    # user/ would otherwise replace them silently at install time.
+    keep_out = shutil.ignore_patterns(".git", "__pycache__", "export.cfg", "user")
     if source and (Path(source) / "addons/gdmaim").is_dir():
-        shutil.copytree(Path(source) / "addons/gdmaim", target,
-                        ignore=shutil.ignore_patterns(".git", "__pycache__"))
+        shutil.copytree(Path(source) / "addons/gdmaim", target, ignore=keep_out,
+                        dirs_exist_ok=True)
         print(f"  addons/gdmaim <- {source}")
         return
     if source and (Path(source) / "plugin.cfg").is_file():
-        shutil.copytree(Path(source), target, ignore=shutil.ignore_patterns(".git"))
+        shutil.copytree(Path(source), target, ignore=keep_out, dirs_exist_ok=True)
         print(f"  addons/gdmaim <- {source}")
         return
     print(f"  cloning {UPSTREAM}")
     temporary = root / ".gdmaim-clone"
     subprocess.run(["git", "clone", "--depth", "1", UPSTREAM, str(temporary)], check=True)
-    shutil.copytree(temporary / "addons/gdmaim", target)
+    shutil.copytree(temporary / "addons/gdmaim", target, ignore=keep_out, dirs_exist_ok=True)
     shutil.rmtree(temporary, ignore_errors=True)
     print("  addons/gdmaim <- upstream")
 
@@ -189,36 +209,74 @@ def locks(root: Path, folders: list[str]) -> tuple[list[str], list[str], list[st
     """
     reached: set[str] = set()
     declared: set[str] = set()
+    reached_prop: set[str] = set()
+    declared_var: set[str] = set()
     for script in _project_scripts(root, folders):
         text = script.read_text(encoding="utf-8", errors="replace")
         for pattern in (REACHED, CALLABLE):
             reached.update(match.group(1) for match in pattern.finditer(text))
         for pattern in (DECLARED, SIGNAL):
             declared.update(match.group(1) for match in pattern.finditer(text))
+        reached_prop.update(match.group(1) for match in PROPERTY.finditer(text))
+        declared_var.update(match.group(1) for match in DECLARED_VAR.finditer(text))
 
     builtins_file = root / "addons/gdmaim/builtins.gd"
     builtins = set(re.findall(r'"(\w+)"', builtins_file.read_text(encoding="utf-8", errors="replace"))) \
         if builtins_file.is_file() else set()
 
-    ignore_file = root / "addons/gdmaim/user/ignore_tokens.txt"
-    ignored = set()
-    if ignore_file.is_file():
-        ignored = {line.strip() for line in ignore_file.read_text(encoding="utf-8").splitlines()
-                   if line.strip() and not line.startswith("#")}
+    ignored = set(read_locks(root))
+    # The manual block is a human's answer to what no scan can see, so it is never `stale`.
+    manual = set(manual_locks(root))
 
-    needed = sorted((reached & declared) - builtins)
-    missing = sorted(set(needed) - ignored)
-    stale = sorted(ignored - set(needed))
+    # A property counts only when this project declares a `var` of that name: `row.get("id")` on a
+    # Dictionary names a key and not a member, and intersecting with the declarations drops it.
+    needed = sorted(((reached & declared) | (reached_prop & declared_var)) - builtins)
+    missing = sorted(set(needed) - ignored - manual)
+    stale = sorted(ignored - set(needed) - manual)
     return needed, missing, stale
 
 
-def write_locks(root: Path, needed: list[str]) -> Path:
+def _lock_lines(root: Path) -> list[str]:
     path = root / "addons/gdmaim/user/ignore_tokens.txt"
+    return path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
+
+
+def manual_locks(root: Path) -> list[str]:
+    """Every name below the manual marker: the residue no scan can reach."""
+    lines = _lock_lines(root)
+    if MANUAL_MARK not in lines:
+        return []
+    return [line.strip() for line in lines[lines.index(MANUAL_MARK) + 1:]
+            if line.strip() and not line.startswith("#")]
+
+
+def manual_block(root: Path) -> list[str]:
+    """...and those lines verbatim, comments included, so regeneration can put them back."""
+    lines = _lock_lines(root)
+    return lines[lines.index(MANUAL_MARK) + 1:] if MANUAL_MARK in lines else []
+
+
+def read_locks(root: Path) -> list[str]:
+    return [line.strip() for line in _lock_lines(root)
+            if line.strip() and not line.startswith("#")]
+
+
+def write_locks(root: Path, needed: list[str]) -> Path:
+    """The scan's names, then the manual block verbatim. Dropping that block was how a
+    hand-locked name vanished on the next regeneration and broke only the exported build."""
+    path = root / "addons/gdmaim/user/ignore_tokens.txt"
+    kept = manual_block(root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    header = ("# Symbols this project reaches through a string literal. GDMaim renames a\n"
-              "# declaration and never a string, so an unlisted name breaks in the exported\n"
-              "# build and nowhere else. Regenerated by: ship.py obfuscate --locks\n")
-    path.write_text(header + "\n".join(needed) + "\n", encoding="utf-8")
+    header = "\n".join([
+        "# Symbols this project reaches through a string literal. GDMaim renames a",
+        "# declaration and never a string, so an unlisted name breaks in the exported",
+        "# build and nowhere else. Regenerated by: ship.py obfuscate --locks",
+        "# Everything below the MANUAL marker is kept exactly as it stands.",
+    ]) + "\n"
+    out = header + "\n".join(needed) + "\n\n" + MANUAL_MARK + "\n"
+    if kept:
+        out += "\n".join(kept) + "\n"
+    path.write_text(out, encoding="utf-8")
     return path
 
 

@@ -706,7 +706,10 @@ def obfuscate(cfg: config_lib.Config, regenerate: bool = False, check: bool = Fa
         _exclude_gdmaim(root)
         _turn_on(cfg)
     if not gdmaim_lib.installed(root):
-        fail("addons/gdmaim is not installed -- run: ship.py obfuscate")
+        # Usually a fresh worktree: the addon is gitignored while its config is tracked, so a
+        # checkout has export.cfg and ignore_tokens.txt and no plugin to read them.
+        fail("addons/gdmaim is not installed -- the addon is gitignored, so a fresh worktree or "
+             "clone has none. Run: ship.py obfuscate  (installs it from gdmaim_src, or upstream)")
         return 1
 
     needed, missing, stale = gdmaim_lib.locks(root, cfg["obfuscation"]["scan"])
