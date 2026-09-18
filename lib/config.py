@@ -126,7 +126,8 @@ class Variant:
     out: str | None        # export path relative to the project, or the preset's own
     strip: dict | None     # replaces the top-level `strip` for this export; None = inherit
     archive: str | None    # a flat .zip of the export, relative to the project
-    addon: str | None      # an addon the export needs installed first (e.g. playgama_bridge)
+    addon: str | None      # a store SDK the export needs installed first (playgama_bridge, gamepix)
+    post: str | None       # a command run from the project root after the export and the archive
     explicit: bool
 
     @property
@@ -172,7 +173,7 @@ class Config:
         entry = table.get(target)
         if entry is None and target in PLATFORMS:
             _, preset, _ = PLATFORMS[target]
-            return Variant(target, target, preset, None, None, None, None, explicit=False)
+            return Variant(target, target, preset, None, None, None, None, None, explicit=False)
         if entry is None:
             known = ", ".join([*PLATFORMS, *table])
             raise SystemExit(f"unknown target {target!r} -- not a platform and not declared "
@@ -195,6 +196,7 @@ class Config:
             strip=strip,
             archive=str(entry["archive"]) if entry.get("archive") else None,
             addon=str(entry["addon"]) if entry.get("addon") else None,
+            post=str(entry["post"]) if entry.get("post") else None,
             explicit=True,
         )
 

@@ -8,6 +8,7 @@
     py ship.py build web           # one target, or one named variant: build playgama
     py ship.py serve [target]      # open a web export over HTTP
     py ship.py playgama            # install Playgama Bridge, register it, add its preset
+    py ship.py gamepix             # the same for the GamePix plugin
     py ship.py audit               # what is actually inside the pack
     py ship.py boot                # run the exported artifact and read its output
     py ship.py check-paths         # machine paths about to be committed
@@ -36,11 +37,13 @@ sys.path.insert(0, str(HERE))
 
 from lib import audit as audit_lib      # noqa: E402
 from lib import config as config_lib    # noqa: E402
+from lib import gamepix as gamepix_lib  # noqa: E402
 from lib import gdmaim as gdmaim_lib    # noqa: E402
 from lib import paths as paths_lib      # noqa: E402
 from lib import playgama as playgama_lib  # noqa: E402
 from lib import review as review_lib    # noqa: E402
 from lib import rules                   # noqa: E402
+from lib import sdk as sdk_lib          # noqa: E402
 from lib import serve as serve_lib      # noqa: E402
 from lib import yamlish                 # noqa: E402
 
@@ -55,8 +58,10 @@ GREEN, RED, YELLOW, CYAN, OFF = "\033[32m", "\033[31m", "\033[33m", "\033[36m", 
 if os.name == "nt":
     os.system("")  # turn on ANSI in a legacy console; harmless in a modern one
 
-# Addons a variant can name under `addon:` and have installed before its export.
-ADDONS = {"playgama_bridge": playgama_lib}
+# Store SDKs a variant can name under `addon:` and have installed before its
+# export. Each is a provider in the sense of lib/sdk.py, and each has a ship.py
+# subcommand of its own name that does the setup half.
+ADDONS = {playgama_lib.KEY: playgama_lib, gamepix_lib.KEY: gamepix_lib}
 
 failures: list[str] = []
 
@@ -309,10 +314,10 @@ def ensure_addon(cfg: config_lib.Config, variant: config_lib.Variant) -> None:
         return
     if module.installed(cfg.root):
         return
-    module.install(cfg.root, cfg.local.get(f"{variant.addon}_src"))
+    module.install(cfg.root, cfg.local.get(f"{module.KEY}_src"))
     module.enable(cfg.root)
     ok(f"{variant.name}: {module.ADDON} installed and registered; the preset is yours to check "
-       f"-- ship.py {variant.addon.split('_')[0]} does that")
+       f"-- ship.py {module.COMMAND} does that")
 
 
 def carry_payload(cfg: config_lib.Config, engine: str, out: Path) -> None:
@@ -509,6 +514,7 @@ def _came_out(cfg: config_lib.Config, variant: config_lib.Variant, engine: str,
             warn(f"index.html from disk fails with \"Failed to fetch\" -- open it with: {serve}")
         if variant.archive and not failures:
             archive_variant(cfg, variant, out, since)
+        run_post(cfg, variant)
         return
     pack = out.with_suffix(".pck")
     if pack.is_file():
@@ -525,6 +531,36 @@ def _came_out(cfg: config_lib.Config, variant: config_lib.Variant, engine: str,
     carry_payload(cfg, engine, out)
     if variant.archive and not failures:
         archive_variant(cfg, variant, out, since)
+    run_post(cfg, variant)
+
+
+def run_post(cfg: config_lib.Config, variant: config_lib.Variant) -> None:
+    """`post:` on a variant -- the project's own last step, run from its root.
+
+    A store's size budget counts the bytes its host serves, and a host that
+    sends no HTTP compression counts a 17 MB .wasm in full; the fix is the
+    project's -- gzip the engine and the pack, put a fetch shim in index.html,
+    rebuild the zip -- and run by hand after the build it was the step that got
+    forgotten before an upload. So it runs here: after the export, the file
+    check and the archive, and a non-zero exit fails the build. Through the
+    shell, as written, because it is the project's command line and not ours.
+    Only `build` ever gets here -- `doctor`, `review` and `audit` execute nothing.
+    """
+    if not variant.post or failures:
+        return
+    print(f"  $ {variant.post}", flush=True)   # before the command's own output, not after
+    done = subprocess.run(variant.post, shell=True, cwd=cfg.root, timeout=1800)
+    if done.returncode != 0:
+        fail(f"{variant.name}: post command exited {done.returncode}: {variant.post}")
+        return
+    ok(f"{variant.name}: post command done")
+    if variant.archive:
+        # The size printed by the archive step is no longer the size on disk.
+        zip_path = _inside_project(cfg, variant.archive)
+        if zip_path.is_file():
+            ok(f"{variant.name}: {zip_path.name} is now {zip_path.stat().st_size / 1048576:.1f} MB")
+        else:
+            fail(f"{variant.name}: {variant.archive} is gone after the post command")
 
 
 # ------------------------------------------------------------------------- boot
@@ -691,10 +727,19 @@ def review(cfg: config_lib.Config) -> int:
         dropped = set(strip["autoloads"])
         stripped_everywhere = dropped if stripped_everywhere is None else stripped_everywhere & dropped
         bad, iffy = review_lib.halves(root, exclude.group(1) if exclude else "", strip)
+        if variant.platform == "web":
+            # Each web variant carries exactly the SDK it names, and no other.
+            iffy += sdk_lib.foreign(root, ADDONS.get(variant.addon), list(ADDONS.values()),
+                                    exclude.group(1) if exclude else "", strip)
+        if variant.addon and variant.addon not in ADDONS:
+            bad.append(f"addon {variant.addon!r} is not one this tool knows ({', '.join(ADDONS)})")
         for what in bad:
             fail(f"{variant.name}: {what}")
         for what in iffy:
             warn(f"{variant.name}: {what}")
+    for module in ADDONS.values():
+        for what in module.review(root, preset_text):
+            warn(what)
     for name, path in review_lib.autoloads(root):
         if name in (stripped_everywhere or set()):
             continue
@@ -1236,7 +1281,8 @@ def _starter(version: str, seen: list[str], hygiene: list[str], required: list,
         '#     preset: "Web Playgama"          # its own block in export_presets.cfg',
         "#     out: build/playgama/web/index.html",
         "#     archive: build/playgama/game-web.zip   # flat, index.html at the root",
-        "#     addon: playgama_bridge          # installed before the export when absent",
+        "#     addon: playgama_bridge          # installed before the export when absent; or: gamepix",
+        "#     post: python tools/pack_web.py  # the project's own last step; a non-zero exit fails the build",
         "#   web:                            # the plain web build: the SDK held out of it",
         "#     strip:",
         '#       autoloads: ["Bridge"]',
@@ -1286,6 +1332,7 @@ def _starter_local(candidates: list[tuple[Path, str]]) -> str:
         "",
         '# gdmaim_src: "<full path to a gdmaim checkout>"   # cloned from upstream when absent',
         '# playgama_bridge_src: "<checkout, addon folder or release zip>"   # else the latest release is downloaded',
+        '# gamepix_src: "<checkout, addon folder or the plugin zip>"          # else the archive from the GamePix docs',
         "",
     ]
     return "\n".join(lines)
@@ -1410,23 +1457,34 @@ def _web_target(cfg: config_lib.Config) -> str | None:
     return next((v.name for v in cfg.variants() if v.platform == "web"), None)
 
 
-def playgama(cfg: config_lib.Config) -> int:
-    """Put Playgama Bridge into the project: the addon, its autoload and plugin,
-    and a "Web Playgama" preset beside the plain Web one. Writes into the project."""
+def setup_sdk(cfg: config_lib.Config, module) -> int:
+    """Put a store's SDK into the project: the addon, a web preset of its own
+    beside the plain one, its autoload and plugin. Writes into the project.
+
+    The preset is written BEFORE the plugin is enabled. GamePix's plugin appends
+    an unfiltered preset of its own the first time the editor loads and finds
+    none with its name; an interrupted run must not leave that door open.
+    """
     root = cfg.root
-    step("Playgama Bridge")
-    playgama_lib.install(root, cfg.local.get("playgama_bridge_src"))
-    playgama_lib.enable(root)
-    ok(f"{playgama_lib.ADDON} {playgama_lib.version(root)}: autoload Bridge and the plugin are registered")
-    variant = next((v for v in cfg.variants() if v.addon == "playgama_bridge"), None)
-    preset = variant.preset if variant else playgama_lib.PRESET
-    out = (variant.out if variant and variant.out else None) or playgama_lib.OUT
-    for line in playgama_lib.split_presets(root, preset, out):
+    step(module.ADDON)
+    others = [m for m in ADDONS.values() if m is not module]
+    module.install(root, cfg.local.get(f"{module.KEY}_src"))
+    variant = next((v for v in cfg.variants() if v.addon == module.KEY), None)
+    preset = variant.preset if variant else module.PRESET
+    out = (variant.out if variant and variant.out else None) or module.OUT
+    for line in module.split_presets(root, preset, out, others):
         ok(line)
+    module.enable(root)
+    ok(f"{module.ADDON} {module.version(root)}: autoload {module.AUTOLOAD} first in [autoload], "
+       "the plugin registered")
+    presets = root / "export_presets.cfg"
+    for what in module.review(root, presets.read_text(encoding="utf-8") if presets.is_file() else ""):
+        warn(what)
     if variant is None:
-        warn(f"no variant names addon: playgama_bridge in {config_lib.TRACKED} -- add this, "
-             "then `ship.py build playgama`:")
-        for line in playgama_lib.STARTER:
+        here = [m for m in others if m.installed(root)]
+        warn(f"no variant names addon: {module.KEY} in {config_lib.TRACKED} -- add this, "
+             f"then `ship.py build {module.VARIANT}`:")
+        for line in sdk_lib.starter(module, here):
             print(f"        {line}")
     return 1 if failures else 0
 
@@ -1466,6 +1524,7 @@ def main() -> int:
     p.add_argument("--force", action="store_true", help="replace an existing key (orphans old builds)")
 
     sub.add_parser("playgama", help="install Playgama Bridge, register it, add its preset")
+    sub.add_parser("gamepix", help="install the GamePix plugin, register it, add its preset")
 
     p = sub.add_parser("obfuscate", help="install and configure GDMaim, keep its lock list")
     p.add_argument("--locks", action="store_true", help="regenerate the lock list")
@@ -1497,8 +1556,9 @@ def main() -> int:
     if args.command == "audit":
         target = args.target or _web_target(cfg) or cfg.targets[0]
         return run_audit(cfg, target, args.all, args.check)
-    if args.command == "playgama":
-        return playgama(cfg)
+    for module in ADDONS.values():
+        if args.command == module.COMMAND:
+            return setup_sdk(cfg, module)
     if args.command == "check-paths":
         return check_paths(cfg, staged=not args.tree)
     if args.command == "init":

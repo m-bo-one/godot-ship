@@ -367,9 +367,21 @@ class Starter(unittest.TestCase):
         data = yamlish.loads("\n".join(lines), prefer_pyyaml=False)
         self.assertEqual(data["variants"]["playgama"]["preset"], "Web Playgama")
         self.assertEqual(data["variants"]["web"]["strip"]["autoloads"], ["Bridge"])
-        printed = [l for l in playgama_lib.STARTER if not l.startswith("targets:")]
-        data = yamlish.loads("\n".join(printed), prefer_pyyaml=False)
-        self.assertEqual(data["variants"]["playgama"]["addon"], "playgama_bridge")
+        from lib import gamepix as gamepix_lib
+        from lib import sdk as sdk_lib
+        for module, others in ((playgama_lib, []), (gamepix_lib, [playgama_lib]),
+                               (playgama_lib, [gamepix_lib])):
+            printed = [l for l in sdk_lib.starter(module, others) if not l.startswith("targets:")]
+            data = yamlish.loads("\n".join(printed), prefer_pyyaml=False)
+            self.assertEqual(data["variants"][module.VARIANT]["addon"], module.KEY)
+            # The plain web build strips every SDK in the tree.
+            self.assertEqual(data["variants"]["web"]["strip"]["autoloads"],
+                             [module.AUTOLOAD] + [o.AUTOLOAD for o in others])
+            for other in others:
+                self.assertEqual(data["variants"][module.VARIANT]["strip"]["autoloads"],
+                                 [other.AUTOLOAD])
+                self.assertIn(module.AUTOLOAD,
+                              data["variants"][other.VARIANT]["strip"]["autoloads"])
 
 
 if __name__ == "__main__":

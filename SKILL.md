@@ -17,6 +17,7 @@ py ~/.claude/skills/godot-ship/ship.py build
 | One target | `ship.py build web` |
 | One named variant of a platform | `ship.py build playgama` — see **Variants** |
 | Playgama Bridge into the project | `ship.py playgama` — addon, autoload, plugin, its own preset |
+| The GamePix plugin into the project | `ship.py gamepix` — the same, and its preset MUST be named `GamePix…` |
 | Audit the setup, not just the pack | `ship.py review` |
 | What is installed and configured | `ship.py doctor` |
 | Open a web build | `ship.py serve [target]` — it cannot run from disk |
@@ -142,6 +143,7 @@ variants:
     out: build/playgama/web/index.html
     archive: build/playgama/game-web.zip   # flat, index.html at the zip root
     addon: playgama_bridge        # installed before the export when absent
+    post: python tools/pack_web.py  # the project's own last step, see below
     strip:                        # REPLACES the top-level strip for this export
       autoloads: ["QaDriver"]
   web:                            # the plain build: the SDK held out of it
@@ -178,6 +180,14 @@ What a variant changes, and why each rule is the way it is:
   export left in the folder held out and named. That is what a store uploader
   accepts, and the leftover-file rule exists because a build with the SDK held
   out once shipped the SDK's `.js` from the export before it.
+- **`post:` on a variant** is a command run from the project root after the
+  export, the file check and the archive; a non-zero exit fails the build, and
+  the archive's size is read again afterwards. It exists for the step a store
+  forces on a project and the project used to run by hand — gzip the `.wasm`
+  and the `.pck` and put a fetch shim in `index.html`, because the store's host
+  sends no HTTP compression and counts the bytes in full against its size
+  budget. Run by hand, it is the step forgotten before an upload. Only `build`
+  runs it; `doctor`, `review` and `audit` execute nothing.
 - `audit`, `boot`, `serve` and `review` take a variant name where they take a
   target; `boot` skips a web variant, `serve` defaults to `web` or the first
   web variant. The obfuscation lock scan runs once per build — the tree is
@@ -191,7 +201,40 @@ the `Bridge` autoload *first* in `[autoload]` and the plugin in
 `[editor_plugins]`, and splits the Web preset in two: the plain one loses the
 Bridge shell and excludes `addons/playgama_bridge/*`, the new `"Web Playgama"`
 keeps the shell and the addon. Then it prints the `variants:` block to paste.
-Playgama's uploader wants exactly the flat zip above.
+Playgama's uploader wants exactly the flat zip above. Bridge is also how
+GameDistribution, CrazyGames, Yandex and others are reached — they are
+platforms inside the same js, chosen at run time by hostname — so the one
+Playgama build serves them; GameDistribution needs only
+`platforms.game_distribution.gameId` in `playgama-bridge-config.json`.
+
+**GamePix** is not inside Bridge; it has a Godot plugin of its own, and
+`ship.py gamepix` does for it what `ship.py playgama` does for Bridge: the
+addon (from `gamepix_src`, else the archive linked from
+my.gamepix.com/sdk/doc/godot-plugin — there is no release API, the URL is a
+constant), the `GPX` autoload first, the plugin, a `"GamePix"` preset copied
+from the plain Web one. Two things about it are not choices:
+
+- **The preset's name must begin with `GamePix`.** The plugin's `_enter_tree`
+  — a headless export included — appends a preset of its own whenever no preset
+  name does: `all_resources`, an *empty* `exclude_filter`, no
+  `custom_template` keys. Name yours "Web GamePix" and the file grows a second,
+  unfiltered one called exactly "GamePix" that ships `docs/`, `tools/` and
+  every dev addon. `review` warns about any `GamePix*` preset that looks like
+  that. The tool writes the preset *before* it enables the plugin, for the
+  same reason.
+- **The folder is `addons/gpx-godot-plugin`**, whatever the zip is called:
+  `plugin.gd` hardcodes the shell path under it.
+
+**Each web variant carries exactly the SDK it names, and no other.** GamePix:
+"games must either use the GamePix SDK or be entirely SDK-free" — and the
+others are no kinder. Every provider's setup command holds its addon out of
+every *other* web preset and holds the other installed SDKs out of its own;
+the `strip` lists are yours, and the command prints them. `review` warns per
+web variant about another store's autoload still registered, its plugin still
+enabled (it re-registers the autoload during the export), or its files not
+excluded — and a plain `web` variant, naming no SDK, must carry none. Note
+what none of this does: the *game* still has to talk to `GPX` where it talked
+to `Bridge`; the tool ships the SDK, it does not write the adapter.
 
 ## Machine paths
 
