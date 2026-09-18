@@ -9,6 +9,7 @@
     py ship.py serve [target]      # open a web export over HTTP
     py ship.py playgama            # install Playgama Bridge, register it, add its preset
     py ship.py gamepix             # the same for the GamePix plugin
+    py ship.py crazygames          # the same for the CrazyGames SDK (needs crazygames_src)
     py ship.py audit               # what is actually inside the pack
     py ship.py boot                # run the exported artifact and read its output
     py ship.py check-paths         # machine paths about to be committed
@@ -37,6 +38,7 @@ sys.path.insert(0, str(HERE))
 
 from lib import audit as audit_lib      # noqa: E402
 from lib import config as config_lib    # noqa: E402
+from lib import crazygames as crazygames_lib  # noqa: E402
 from lib import gamepix as gamepix_lib  # noqa: E402
 from lib import gdmaim as gdmaim_lib    # noqa: E402
 from lib import paths as paths_lib      # noqa: E402
@@ -61,7 +63,8 @@ if os.name == "nt":
 # Store SDKs a variant can name under `addon:` and have installed before its
 # export. Each is a provider in the sense of lib/sdk.py, and each has a ship.py
 # subcommand of its own name that does the setup half.
-ADDONS = {playgama_lib.KEY: playgama_lib, gamepix_lib.KEY: gamepix_lib}
+ADDONS = {playgama_lib.KEY: playgama_lib, gamepix_lib.KEY: gamepix_lib,
+          crazygames_lib.KEY: crazygames_lib}
 
 failures: list[str] = []
 
@@ -512,6 +515,15 @@ def _came_out(cfg: config_lib.Config, variant: config_lib.Variant, engine: str,
             ok(f"{target}: {total / 1048576:.1f} MB, {len(list(out.parent.iterdir()))} files")
             serve = "py ship.py serve" + (f" {target}" if variant.explicit else "")
             warn(f"index.html from disk fails with \"Failed to fetch\" -- open it with: {serve}")
+            # What the variant's store refuses at upload, said here instead: file
+            # count, total size, the initial-download budget. Only the provider knows.
+            check = getattr(ADDONS.get(variant.addon), "check_export", None)
+            if check:
+                bad, iffy = check(out.parent)
+                for what in bad:
+                    fail(f"{target}: {what}")
+                for what in iffy:
+                    warn(f"{target}: {what}")
         if variant.archive and not failures:
             archive_variant(cfg, variant, out, since)
         run_post(cfg, variant)
@@ -1281,7 +1293,7 @@ def _starter(version: str, seen: list[str], hygiene: list[str], required: list,
         '#     preset: "Web Playgama"          # its own block in export_presets.cfg',
         "#     out: build/playgama/web/index.html",
         "#     archive: build/playgama/game-web.zip   # flat, index.html at the root",
-        "#     addon: playgama_bridge          # installed before the export when absent; or: gamepix",
+        "#     addon: playgama_bridge          # installed before the export when absent; or: gamepix, crazygames",
         "#     post: python tools/pack_web.py  # the project's own last step; a non-zero exit fails the build",
         "#   web:                            # the plain web build: the SDK held out of it",
         "#     strip:",
@@ -1333,6 +1345,7 @@ def _starter_local(candidates: list[tuple[Path, str]]) -> str:
         '# gdmaim_src: "<full path to a gdmaim checkout>"   # cloned from upstream when absent',
         '# playgama_bridge_src: "<checkout, addon folder or release zip>"   # else the latest release is downloaded',
         '# gamepix_src: "<checkout, addon folder or the plugin zip>"          # else the archive from the GamePix docs',
+        '# crazygames_src: "<the zip from the Godot Asset Store, or unpacked>" # REQUIRED for it: no script can fetch that one',
         "",
     ]
     return "\n".join(lines)
@@ -1475,7 +1488,8 @@ def setup_sdk(cfg: config_lib.Config, module) -> int:
     for line in module.split_presets(root, preset, out, others):
         ok(line)
     module.enable(root)
-    ok(f"{module.ADDON} {module.version(root)}: autoload {module.AUTOLOAD} first in [autoload], "
+    names = " then ".join(name for name, _ in sdk_lib.autoloads(module))
+    ok(f"{module.ADDON} {module.version(root)}: autoload {names} first in [autoload], "
        "the plugin registered")
     presets = root / "export_presets.cfg"
     for what in module.review(root, presets.read_text(encoding="utf-8") if presets.is_file() else ""):
@@ -1525,6 +1539,8 @@ def main() -> int:
 
     sub.add_parser("playgama", help="install Playgama Bridge, register it, add its preset")
     sub.add_parser("gamepix", help="install the GamePix plugin, register it, add its preset")
+    sub.add_parser("crazygames", help="install the CrazyGames SDK from crazygames_src, register "
+                                      "it, add its preset")
 
     p = sub.add_parser("obfuscate", help="install and configure GDMaim, keep its lock list")
     p.add_argument("--locks", action="store_true", help="regenerate the lock list")

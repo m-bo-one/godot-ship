@@ -16,10 +16,15 @@ its upstream plugin hardcodes:
     ADDON          the addon folder, relative to the project
     PLUGIN         its plugin.cfg, as project.godot names it
     AUTOLOAD       the singleton its plugin registers, and AUTOLOAD_PATH, its value
-    SHELL          html/custom_html_shell for its preset
+    AUTOLOADS      instead, when it registers several: [(name, value), ...] in the
+                   order they must load -- the first is what the rest are built on
+    SHELL          html/custom_html_shell for its preset; "" when the SDK loads its js
+                   at run time and the preset keeps Godot's own shell
     EXCLUDE        the pattern that holds the whole addon out of another preset
     PRESET, OUT    the preset it gets and where that exports
-    download()     -> (label, zip bytes) from upstream
+    download()     -> (label, zip bytes) from upstream, or SystemExit saying where
+                   a person gets the zip when no script can
+    pick(found)    optional: which plugin.cfg, when an archive holds several addons
 
 The functions here take the provider as `p`. Everything that writes is reached
 only from the provider's own command and from a build of a variant naming it.
@@ -42,6 +47,11 @@ def installed(root: Path, p) -> bool:
     return (root / p.ADDON / "plugin.cfg").is_file()
 
 
+def autoloads(p) -> list[tuple[str, str]]:
+    """[(name, value)] in load order -- one for most SDKs, several for some."""
+    return list(getattr(p, "AUTOLOADS", None) or [(p.AUTOLOAD, p.AUTOLOAD_PATH)])
+
+
 def version(root: Path, p) -> str:
     text = (root / p.ADDON / "plugin.cfg").read_text(encoding="utf-8", errors="replace")
     found = re.search(r'^version="([^"]*)"', text, flags=re.M)
@@ -57,7 +67,7 @@ def fetch(url: str) -> bytes:
         return response.read()
 
 
-def unzip(data: bytes, target: Path) -> None:
+def unzip(data: bytes, target: Path, p=None) -> None:
     """Copy the folder holding plugin.cfg to `target`, whatever the zip calls it.
 
     Release zips have held `addons/<name>/...`, the addon folder at the root, and
@@ -68,11 +78,24 @@ def unzip(data: bytes, target: Path) -> None:
     """
     with zipfile.ZipFile(io.BytesIO(data)) as archive, tempfile.TemporaryDirectory() as tmp:
         archive.extractall(tmp)
-        found = sorted(Path(tmp).rglob("plugin.cfg"), key=lambda path: len(path.parts))
-        if not found:
-            raise SystemExit("the zip holds no plugin.cfg -- it is not a Godot addon")
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(found[0].parent, target, dirs_exist_ok=True, ignore=KEEP_OUT)
+        shutil.copytree(locate(Path(tmp), p), target, dirs_exist_ok=True, ignore=KEEP_OUT)
+
+
+def locate(folder: Path, p) -> Path:
+    """The addon's folder somewhere under `folder`: the one holding plugin.cfg.
+
+    An archive can hold more than one -- CrazyGames ships its Godot 3 and its
+    Godot 4 addon side by side, at the same depth -- and "the first plugin.cfg
+    found" then installs whichever sorts first, which loads into the wrong
+    engine as a wall of parse errors. The provider says which, with `pick`.
+    """
+    found = sorted((path for path in folder.rglob("plugin.cfg") if ".git" not in path.parts),
+                   key=lambda path: (len(path.parts), path.as_posix()))
+    if not found:
+        raise SystemExit(f"no plugin.cfg under {folder} -- it is not a Godot addon")
+    pick = getattr(p, "pick", None)
+    return (pick(found) if pick else found[0]).parent
 
 
 def install(root: Path, p, source: str | None) -> None:
@@ -85,18 +108,22 @@ def install(root: Path, p, source: str | None) -> None:
     if source:
         src = Path(source)
         if src.is_file() and src.suffix == ".zip":
-            unzip(src.read_bytes(), target)
+            unzip(src.read_bytes(), target, p)
         elif (src / p.ADDON).is_dir():
             shutil.copytree(src / p.ADDON, target, ignore=KEEP_OUT, dirs_exist_ok=True)
         elif (src / "plugin.cfg").is_file():
             shutil.copytree(src, target, ignore=KEEP_OUT, dirs_exist_ok=True)
+        elif src.is_dir():
+            # The unpacked archive, under whatever name upstream gave the folder inside.
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(locate(src, p), target, ignore=KEEP_OUT, dirs_exist_ok=True)
         else:
             raise SystemExit(f"{p.KEY}_src is {source}: not a release zip, not a checkout "
                              f"holding {p.ADDON}, and not the addon folder itself")
         print(f"  {p.ADDON} <- {source}")
         return
     label, data = p.download()
-    unzip(data, target)
+    unzip(data, target, p)
     print(f"  {p.ADDON} <- {label}")
 
 
@@ -125,8 +152,12 @@ def enable(root: Path, p) -> None:
         else:
             text = text.rstrip("\n") \
                 + f'\n\n[editor_plugins]\n\nenabled=PackedStringArray("{p.PLUGIN}")\n'
-    if not re.search(rf"(?m)^{re.escape(p.AUTOLOAD)}=", text):
-        line = f'{p.AUTOLOAD}="{p.AUTOLOAD_PATH}"'
+    missing = [f'{name}="{value}"' for name, value in autoloads(p)
+               if not re.search(rf"(?m)^{re.escape(name)}=", text)]
+    if missing:
+        # Together and in the provider's order: an SDK with two singletons builds
+        # the second on the first, and Godot instantiates them as the file lists them.
+        line = "\n".join(missing)
         if re.search(r"(?m)^\[autoload\]$", text):
             # The header and the blank line(s) under it, replaced together: inserting
             # after the header alone leaves a gap between this entry and the next.
@@ -228,7 +259,7 @@ def split_presets(root: Path, p, preset: str, out: str, others=()) -> list[str]:
             continue
         body = hold_out(bodies[i], p)
         cleared = re.sub(rf'^html/custom_html_shell="{re.escape(p.SHELL)}"$',
-                         'html/custom_html_shell=""', body, flags=re.M)
+                         'html/custom_html_shell=""', body, flags=re.M) if p.SHELL else body
         what = [f"{p.EXCLUDE} excluded"] if body != bodies[i] else []
         if cleared != body:
             what.insert(0, "shell cleared")
@@ -247,10 +278,11 @@ def split_presets(root: Path, p, preset: str, out: str, others=()) -> list[str]:
         store = re.sub(r'^name=".*"$', lambda m: f'name="{preset}"', store, count=1, flags=re.M)
         store = re.sub(r'^export_path=".*"$', lambda m: f'export_path="{out}"', store,
                        count=1, flags=re.M)
-        shell = f'html/custom_html_shell="{p.SHELL}"'
-        store = re.sub(r'^html/custom_html_shell=".*"$', lambda m: shell, store, flags=re.M)
-        if shell not in store:
-            store = store.rstrip("\n") + f"\n{shell}\n"
+        if p.SHELL:
+            shell = f'html/custom_html_shell="{p.SHELL}"'
+            store = re.sub(r'^html/custom_html_shell=".*"$', lambda m: shell, store, flags=re.M)
+            if shell not in store:
+                store = store.rstrip("\n") + f"\n{shell}\n"
         store = let_in(store, p)
         held = []
         for other in others:
@@ -259,7 +291,8 @@ def split_presets(root: Path, p, preset: str, out: str, others=()) -> list[str]:
                 held.append(other.EXCLUDE)
         bodies.append("\n" + store.strip("\n") + "\n")
         bodies[-2] = bodies[-2].rstrip("\n") + "\n"
-        done.append(f'"{preset}" added -> {out}, its shell on, the addon in'
+        done.append(f'"{preset}" added -> {out}, '
+                    + ("its shell on, " if p.SHELL else "") + "the addon in"
                     + (f", {', '.join(held)} out" if held else ""))
 
     rebuilt = head + "".join(bodies)
@@ -278,9 +311,9 @@ def starter(p, others=()) -> list[str]:
     a preset's exclude_filter alone leaves the autoload pointing at nothing.
     """
     def strip(indent: str, providers) -> list[str]:
-        autoloads = ", ".join(f'"{x.AUTOLOAD}"' for x in providers)
+        names = ", ".join(f'"{name}"' for x in providers for name, _ in autoloads(x))
         plugins = ", ".join(f'"{x.PLUGIN}"' for x in providers)
-        return [f"{indent}strip:", f"{indent}  autoloads: [{autoloads}]",
+        return [f"{indent}strip:", f"{indent}  autoloads: [{names}]",
                 f"{indent}  plugins: [{plugins}]"]
 
     lines = [
@@ -323,14 +356,15 @@ def foreign(root: Path, own, providers, exclude_filter: str, strip: dict) -> lis
     for other in providers:
         if other is own or not installed(root, other):
             continue
-        script = other.AUTOLOAD_PATH.lstrip("*")
-        if other.AUTOLOAD not in dropped:
-            warnings.append(f"still registers {other.AUTOLOAD}, another store's SDK -- add it "
+        theirs = autoloads(other)
+        kept = [name for name, _ in theirs if name not in dropped]
+        if kept:
+            warnings.append(f"still registers {', '.join(kept)}, another store's SDK -- add "
                             "to this variant's strip.autoloads")
         if other.PLUGIN not in unplugged:
             warnings.append(f"keeps the plugin {other.PLUGIN} enabled -- it re-registers "
-                            f"{other.AUTOLOAD} during the export; add it to strip.plugins")
-        if not excluded(script, exclude_filter):
+                            f"{theirs[-1][0]} during the export; add it to strip.plugins")
+        if not all(excluded(value.lstrip("*"), exclude_filter) for _, value in theirs):
             warnings.append(f"its preset does not exclude {other.EXCLUDE} -- another store's "
                             "SDK ships in this build")
     return warnings

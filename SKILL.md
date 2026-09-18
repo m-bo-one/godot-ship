@@ -18,6 +18,7 @@ py ~/.claude/skills/godot-ship/ship.py build
 | One named variant of a platform | `ship.py build playgama` — see **Variants** |
 | Playgama Bridge into the project | `ship.py playgama` — addon, autoload, plugin, its own preset |
 | The GamePix plugin into the project | `ship.py gamepix` — the same, and its preset MUST be named `GamePix…` |
+| The CrazyGames SDK into the project | `ship.py crazygames` — needs `crazygames_src`: no script can download that one |
 | Audit the setup, not just the pack | `ship.py review` |
 | What is installed and configured | `ship.py doctor` |
 | Open a web build | `ship.py serve [target]` — it cannot run from disk |
@@ -224,6 +225,41 @@ from the plain Web one. Two things about it are not choices:
   same reason.
 - **The folder is `addons/gpx-godot-plugin`**, whatever the zip is called:
   `plugin.gd` hardcodes the shell path under it.
+
+**CrazyGames** has an official Godot addon too, and `ship.py crazygames` sets
+it up — with four differences that are all read off the addon itself:
+
+- **It cannot be downloaded by a script.** Its only source is the Godot Asset
+  Store page linked from docs.crazygames.com/sdk/intro (Godot tab), which
+  refuses a non-browser, and the store's API does not list it. The user
+  downloads the zip by hand and names it — or the unpacked folder — as
+  `crazygames_src` in the local config. Say so *before* running the command;
+  without it the command stops with exactly that instruction.
+- **The zip holds two addons**, `crazysdk-godot-3` and `crazysdk-godot-4`; the
+  tool takes the second and installs it as `addons/crazygames`, the name the
+  plugin's own script hardcodes.
+- **Two autoloads, order-dependent**: `CrazyGamesBridge` then `CrazyGames` —
+  the second calls the first in its `_ready`. Both go first in `[autoload]`,
+  and *both* names go in every other web variant's `strip.autoloads`.
+- **No HTML shell and no special preset name.** The SDK's js is appended to
+  `<head>` at run time, so the `"CrazyGames"` preset is the plain Web one with
+  the rival SDKs excluded, plus `user-select:none` on the body through
+  `html/head_include` — the store asks for it on mobile, where a long press
+  otherwise selects the whole game. It must export as `index.html`.
+
+After a build of that variant the tool judges the export against the store's
+hard limits, which otherwise surface at upload: at most 1500 files and 250 MB
+(fail), and an initial download — everything fetched before
+`CrazyGames.Game.gameplay_start()` — of at most 50 MB, or 20 MB to be eligible
+for the mobile homepage (warnings). A Godot export fetches its `.wasm` and
+`.pck` whole before the first frame, so the export's size *is* that number.
+What no tool checks: `gameplay_start()`/`gameplay_stop()` are mandatory for a
+full launch, only SDK ads, no custom fullscreen button, no cross-promotion,
+English present, PEGI 12, and a new player in gameplay within one click.
+
+There is a second road: CrazyGames is also a platform inside Playgama Bridge
+(`crazy_games`, by hostname), so a project already speaking Bridge can upload
+its Playgama build there and write no second adapter. One or the other.
 
 **Each web variant carries exactly the SDK it names, and no other.** GamePix:
 "games must either use the GamePix SDK or be entirely SDK-free" — and the

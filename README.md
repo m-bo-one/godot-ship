@@ -48,6 +48,7 @@ py ~/.claude/skills/godot-ship/ship.py build
 | `build [targets]` | export, verify, boot — a target is a platform or a named variant of one |
 | `playgama` | put Playgama Bridge in: the addon, its autoload and plugin, its own web preset |
 | `gamepix` | the same for the GamePix plugin; its preset is named `GamePix`, and has to be |
+| `crazygames` | the same for the CrazyGames SDK, from a zip you download: set `crazygames_src` first |
 | `review` | audit the setup: what is not covered, and what the artifacts give away |
 | `doctor` | engine, key, templates — what is missing |
 | `serve [target]` | open a web build; it cannot run from disk |
@@ -75,8 +76,8 @@ One tree, two web builds — one for a store whose SDK must be in, one for a
 store where it must be out. `variants:` in `godot-ship.yaml` names each with
 its own preset, output folder, strip list and optional flat `.zip`;
 `project.godot` is rewritten around each export and put back between. A
-target without an entry builds exactly as before. `ship.py playgama` and
-`ship.py gamepix` set a store's half of that up, each holding its SDK out of
+target without an entry builds exactly as before. `ship.py playgama`,
+`ship.py gamepix` and `ship.py crazygames` set a store's half of that up, each holding its SDK out of
 every other web build; `review` warns when a build carries an SDK it does not
 name. A variant's `post:` runs the project's own last step after the archive.
 Details are in [SKILL.md](SKILL.md#variants-two-builds-of-one-platform-from-one-tree).

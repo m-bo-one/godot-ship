@@ -37,7 +37,7 @@ py ship.py --project <godot project> build [windows|macos|web]
 
 Every command takes `--project`; without it the CWD is walked upwards for `project.godot`.
 `review` and `check-paths` work outside a Godot project too. `init`, `key`, `obfuscate`,
-`playgama`, `gamepix`, `templates` and `build` **write into the target project** — `doctor`,
+`playgama`, `gamepix`, `crazygames`, `templates` and `build` **write into the target project** — `doctor`,
 `review`, `audit` and `check-paths` never do.
 
 ## Architecture
@@ -54,7 +54,7 @@ project. `lib/` is analysis and pure helpers:
 | [lib/paths.py](lib/paths.py) | the machine-path scanner; reads the git **index**, not the working tree |
 | [lib/gdmaim.py](lib/gdmaim.py) | GDMaim install, its settled settings, the string-reached-symbol lock scan |
 | [lib/sdk.py](lib/sdk.py) | what every store SDK shares: install, autoload/plugin registration, the preset split, the "no foreign SDK" check |
-| [lib/playgama.py](lib/playgama.py), [lib/gamepix.py](lib/gamepix.py) | the providers: the names each upstream plugin hardcodes, its download, its own review warnings |
+| [lib/playgama.py](lib/playgama.py), [lib/gamepix.py](lib/gamepix.py), [lib/crazygames.py](lib/crazygames.py) | the providers: the names each upstream plugin hardcodes, its download, its own review warnings and store limits |
 | [lib/build.py](lib/build.py), [lib/build_templates.py](lib/build_templates.py) | the exporter and the scons template build |
 | [lib/yamlish.py](lib/yamlish.py) | the YAML subset the configs are written in |
 
@@ -119,14 +119,19 @@ it into an exit code. A new check calls `fail()` and lets the verdict decide; it
     `project.godot` is stripped and restored around *each* one -- a variant's `strip` replaces
     the top-level one, never merges with it.
 11. **A store SDK is a provider module, and the mechanics are not copied into it.**
-    `lib/playgama.py` and `lib/gamepix.py` hold constants (`KEY`, `ADDON`, `PLUGIN`, `AUTOLOAD`,
-    `SHELL`, `EXCLUDE`, `PRESET`, ...), a `download()` and a `review()`; everything else is
+    `lib/playgama.py`, `lib/gamepix.py` and `lib/crazygames.py` hold constants (`KEY`, `ADDON`,
+    `PLUGIN`, `AUTOLOAD` or an ordered `AUTOLOADS`, `SHELL` -- empty when the SDK needs none --
+    `EXCLUDE`, `PRESET`, ...), a `download()`, a `review()`, and optionally `pick()` for an archive
+    holding several addons and `check_export()` for the store's own limits; everything else is
     [lib/sdk.py](lib/sdk.py), and `ADDONS` in ship.py is the registry -- a new store is one
     module and one row. The rule they all serve: **each web variant carries exactly the SDK it
     names, and no other** -- setup holds the addon out of every other web preset, `review` warns
     when a strip list or an exclude filter lets a rival through. Names an upstream plugin
-    hardcodes (GamePix: the folder, the autoload, the `GamePix` preset-name prefix) are constants
-    with the reason beside them, never parameters.
+    hardcodes (GamePix: the folder, the autoload, the `GamePix` preset-name prefix; CrazyGames:
+    the folder and the ORDER of its two autoloads) are constants with the reason beside them,
+    never parameters. **Read the addon, not the docs about it**: every one of those facts came
+    from a `plugin.gd`, and a `download()` that cannot work says where a person gets the zip
+    rather than pretending -- a provider is allowed to need `<KEY>_src`.
 12. **`post:` is the only place a tracked config names a command, and only `build` runs it.**
     It is the project's own command line, run through the shell from the project root. The
     read-only commands must stay unable to reach it.
