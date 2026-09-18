@@ -19,10 +19,17 @@ wrapper reports 1.0.1 to the SDK) and the store's docs
 - **The archive holds two addons**, `crazysdk-godot-3` and `crazysdk-godot-4`,
   side by side. The Godot 3 one in a 4.x project is a wall of parse errors on
   load (`yield`), and it sorts first -- hence `pick`.
-- **No script can fetch it.** The only published source is the Godot Asset Store
-  page; it answers a non-browser with 403, and the store's API does not list
-  the asset. `download()` therefore says where a person gets the zip, and
-  `crazygames_src` in the local config is how it gets in.
+- **There is nothing to fetch it from, and that may include a person.** The docs
+  link one source, a Godot Asset Store page, and as of 2026-09-19 that asset is
+  withdrawn or unpublished: in a browser the page reads "The requested asset is
+  not available", and the store's API answers 404 for it while serving every
+  other asset -- to a plain curl as well, so this is not a bot wall, which is
+  what a 403 on the page was first mistaken for here. `download()` therefore
+  promises nothing: it names the page to try, and the two places the addon can
+  still come from -- CrazyGames' developer support, or the `addons/crazygames`
+  folder of a project that already has it. `crazygames_src` takes a zip, the
+  unpacked archive, or that folder. And it says the other road out loud: the
+  same store through Playgama Bridge needs no addon at all.
 
 What the store holds a build to, and the tool can see (requirements/technical):
 at most 1500 files and 250 MB in all; an initial download -- everything fetched
@@ -83,10 +90,15 @@ NO_SELECT = ("<style>body{-webkit-user-select:none;-moz-user-select:none;"
 
 def download() -> tuple[str, bytes]:
     raise SystemExit(
-        "the CrazyGames Godot SDK cannot be downloaded by a script: its only source is the\n"
-        f"  Godot Asset Store, which refuses a non-browser. Download it by hand from\n    {STORE}\n"
-        f"  (linked from {DOCS}) and name the zip -- or the unpacked folder -- in\n"
-        f"  .godot-ship.local.yaml as {KEY}_src.")
+        "the CrazyGames Godot SDK has no download this tool can use. Its docs link one source,\n"
+        f"    {STORE}\n"
+        "  and when last checked (2026-09-19) the store said that asset is not available -- in a\n"
+        "  browser too. Try the page; if it is still gone, ask CrazyGames developer support for\n"
+        "  the archive, or take addons/crazygames from a project that has the official addon\n"
+        "  (the one with Utils/CrazyGamesBridge.gd). Then name the zip, the unpacked archive or\n"
+        f"  that folder in .godot-ship.local.yaml as {KEY}_src.\n"
+        "  Or skip the addon: CrazyGames is a platform inside Playgama Bridge, so the Playgama\n"
+        "  build uploads there as it is.")
 
 
 def pick(found: list[Path]) -> Path:

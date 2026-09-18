@@ -1345,7 +1345,7 @@ def _starter_local(candidates: list[tuple[Path, str]]) -> str:
         '# gdmaim_src: "<full path to a gdmaim checkout>"   # cloned from upstream when absent',
         '# playgama_bridge_src: "<checkout, addon folder or release zip>"   # else the latest release is downloaded',
         '# gamepix_src: "<checkout, addon folder or the plugin zip>"          # else the archive from the GamePix docs',
-        '# crazygames_src: "<the zip from the Godot Asset Store, or unpacked>" # REQUIRED for it: no script can fetch that one',
+        '# crazygames_src: "<the SDK zip, unpacked, or an addons/crazygames folder>" # REQUIRED for it: it has no download',
         "",
     ]
     return "\n".join(lines)

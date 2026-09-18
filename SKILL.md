@@ -18,7 +18,7 @@ py ~/.claude/skills/godot-ship/ship.py build
 | One named variant of a platform | `ship.py build playgama` — see **Variants** |
 | Playgama Bridge into the project | `ship.py playgama` — addon, autoload, plugin, its own preset |
 | The GamePix plugin into the project | `ship.py gamepix` — the same, and its preset MUST be named `GamePix…` |
-| The CrazyGames SDK into the project | `ship.py crazygames` — needs `crazygames_src`: no script can download that one |
+| The CrazyGames SDK into the project | `ship.py crazygames` — needs `crazygames_src`: that addon has no working download |
 | Audit the setup, not just the pack | `ship.py review` |
 | What is installed and configured | `ship.py doctor` |
 | Open a web build | `ship.py serve [target]` — it cannot run from disk |
@@ -229,12 +229,18 @@ from the plain Web one. Two things about it are not choices:
 **CrazyGames** has an official Godot addon too, and `ship.py crazygames` sets
 it up — with four differences that are all read off the addon itself:
 
-- **It cannot be downloaded by a script.** Its only source is the Godot Asset
-  Store page linked from docs.crazygames.com/sdk/intro (Godot tab), which
-  refuses a non-browser, and the store's API does not list it. The user
-  downloads the zip by hand and names it — or the unpacked folder — as
-  `crazygames_src` in the local config. Say so *before* running the command;
-  without it the command stops with exactly that instruction.
+- **It has no working download -- check before promising one.** The docs link a
+  single source, a Godot Asset Store page, and when last checked (2026-09-19)
+  that asset was withdrawn: a browser gets "The requested asset is not
+  available", and the store's API answers 404 for it while serving every other
+  asset. A 403 on that page reads like a bot wall and is not one. So the
+  command cannot fetch it and neither, possibly, can the user: the addon comes
+  from CrazyGames developer support, or from the `addons/crazygames` folder of
+  a project that already has the official one (it holds
+  `Utils/CrazyGamesBridge.gd`; a third-party lookalike under the same folder
+  name does not, and is refused). `crazygames_src` takes the zip, the unpacked
+  archive or that folder. **Offer the Bridge road first** (below) when the
+  project already speaks Bridge: it needs no addon.
 - **The zip holds two addons**, `crazysdk-godot-3` and `crazysdk-godot-4`; the
   tool takes the second and installs it as `addons/crazygames`, the name the
   plugin's own script hardcodes.

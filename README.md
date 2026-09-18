@@ -48,7 +48,7 @@ py ~/.claude/skills/godot-ship/ship.py build
 | `build [targets]` | export, verify, boot — a target is a platform or a named variant of one |
 | `playgama` | put Playgama Bridge in: the addon, its autoload and plugin, its own web preset |
 | `gamepix` | the same for the GamePix plugin; its preset is named `GamePix`, and has to be |
-| `crazygames` | the same for the CrazyGames SDK, from a zip you download: set `crazygames_src` first |
+| `crazygames` | the same for the CrazyGames SDK; it has no working download, so set `crazygames_src` first |
 | `review` | audit the setup: what is not covered, and what the artifacts give away |
 | `doctor` | engine, key, templates — what is missing |
 | `serve [target]` | open a web build; it cannot run from disk |
