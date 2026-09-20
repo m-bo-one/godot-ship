@@ -51,7 +51,7 @@ py ~/.claude/skills/godot-ship/ship.py build
 | `crazygames` | the same for the CrazyGames SDK; it has no working download, so set `crazygames_src` first |
 | `review` | audit the setup: what is not covered, and what the artifacts give away |
 | `doctor` | engine, key, templates — what is missing |
-| `serve [target]` | open a web build; it cannot run from disk |
+| `serve [target]` | open a web build; it cannot run from disk. `--plain` for a store's QA tool |
 | `audit --check` | what is actually inside the pack |
 | `boot` | run the artifact and read its output |
 | `obfuscate` | install and configure GDMaim, keep its lock list |

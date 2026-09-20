@@ -9,7 +9,10 @@ file off the disk carries no type at all.
 The cross-origin headers are sent even though a `thread_support=false` export
 runs without them: they cost nothing, and the day a preset turns threads on, a
 build without `SharedArrayBuffer` stops at a black screen with a console error
-nobody connects to this file.
+nobody connects to this file. Except under `--plain`: the same headers make the
+page refuse every cross-origin script without CORP -- a store SDK's CDN copy,
+its ad providers -- so a store's QA tool pointed at this server reports an ad
+blocker and never shows an ad. Thread-less exports only.
 """
 
 from __future__ import annotations
@@ -28,10 +31,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         ".pck": "application/octet-stream",
         ".js": "text/javascript",
     }
+    # Off for `--plain`: the isolation headers make the page refuse every
+    # cross-origin script without CORP -- a store SDK's CDN copy, its ad
+    # providers -- so a store's QA tool loading this server sees "AdBlock
+    # detected" and never shows an ad. A thread-less export needs none of it.
+    isolate = True
 
     def end_headers(self):
-        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
-        self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
+        if self.isolate:
+            self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+            self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
         self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
@@ -50,13 +59,16 @@ def port_is_free(port: int) -> bool:
             return False
 
 
-def serve(directory: Path, port: int) -> int:
+def serve(directory: Path, port: int, isolate: bool = True) -> int:
     if not (directory / "index.html").is_file():
         raise SystemExit(f"no index.html in {directory} -- export the web target first")
     if not port_is_free(port):
         raise SystemExit(f"port {port} is already in use -- pass --port, or stop the holder")
+    Handler.isolate = isolate
     handler = functools.partial(Handler, directory=str(directory))
-    with socketserver.TCPServer(("127.0.0.1", port), handler) as server:
+    # Threaded: the loader fetches the wasm, the pck and the worklets at once,
+    # and on a single-threaded server every one of them waits for the biggest.
+    with socketserver.ThreadingTCPServer(("127.0.0.1", port), handler) as server:
         print(f"serving  {directory}")
         print(f"open     http://127.0.0.1:{port}/")
         print("Ctrl+C stops it.")

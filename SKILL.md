@@ -21,7 +21,7 @@ py ~/.claude/skills/godot-ship/ship.py build
 | The CrazyGames SDK into the project | `ship.py crazygames` — needs `crazygames_src`: that addon has no working download |
 | Audit the setup, not just the pack | `ship.py review` |
 | What is installed and configured | `ship.py doctor` |
-| Open a web build | `ship.py serve [target]` — it cannot run from disk |
+| Open a web build | `ship.py serve [target]` — it cannot run from disk; `--plain` for a store's QA tool |
 | What is actually inside the pack | `ship.py audit --check` |
 | Run the artifact and read its output | `ship.py boot` |
 | Machine paths about to be committed | `ship.py check-paths` |
@@ -338,7 +338,9 @@ browser refuses on a `file://` origin, and a file off the disk carries no
 `application/wasm` type for the streaming compile either.
 
 ```
-py ship.py serve      # http://127.0.0.1:8000/, right headers, Ctrl+C stops it
+py ship.py serve          # http://127.0.0.1:8000/, right headers, Ctrl+C stops it
+py ship.py serve --plain  # no isolation headers: a store's QA tool loading this
+                          # server otherwise sees "AdBlock" and shows no ad
 ```
 
 Real hosting needs none of this. Three preset settings are load-bearing and two
@@ -457,6 +459,19 @@ These are settled, and each one is a build that broke:
   signed literal, and the script fails to parse at run time.
 - **`export_vars=false`** wherever a binary `.res` holds exported properties:
   GDMaim rewrites `.tscn`/`.tres` that set them and cannot rewrite a binary one.
+- **`custom_tokens_enabled=true`, or the lock list is decoration.** GDMaim reads
+  `ignore_tokens.txt` only behind that flag. With it off, `ship.py obfuscate
+  --check` reports every string-reached symbol locked and the export renames
+  every one of them — found on a Bridge build whose game never reached the SDK
+  once. `review` and a build both refuse that state now.
+- **`multi_filepath` holds every store SDK folder**, written from
+  `obfuscation.exclude` plus every variant's `addon:` without listing them. The
+  game names SDK members in strings and the platform's JavaScript names them
+  from outside the pack; a rename breaks it with no error. What the file
+  already excluded is kept and printed, so it can be moved into the config.
+- **`strip_editor_annotations=false`.** Stripping `@export` makes an inherited
+  scene lose every typed node reference its base scene set, and the child
+  starts with null exports and dies in `_ready`. The annotations cost nothing.
 - **`inject_name=false` is load-bearing, not cosmetic.** It stops a
   `print("GDMaim - Source map '…'")` going into the first autoload — but on 0.3.9
   the same branch also fills the map that registers autoloads as global symbols,

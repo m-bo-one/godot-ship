@@ -6,7 +6,7 @@
     py ship.py doctor              # what is installed, configured and missing
     py ship.py build               # every target in godot-ship.yaml
     py ship.py build web           # one target, or one named variant: build playgama
-    py ship.py serve [target]      # open a web export over HTTP
+    py ship.py serve [target]      # open a web export over HTTP (--plain for a store's QA tool)
     py ship.py playgama            # install Playgama Bridge, register it, add its preset
     py ship.py gamepix             # the same for the GamePix plugin
     py ship.py crazygames          # the same for the CrazyGames SDK (needs crazygames_src)
@@ -764,6 +764,11 @@ def review(cfg: config_lib.Config) -> int:
         _, missing, _ = gdmaim_lib.locks(root, cfg["obfuscation"]["scan"])
         ok("every string-reached symbol is locked") if not missing else \
             fail(f"{len(missing)} string-reached symbol(s) unlocked: {', '.join(missing[:8])}")
+        remarks = gdmaim_lib.review(root, _unobfuscated(cfg))
+        for what in remarks:
+            fail(what)
+        if not remarks:
+            ok("GDMaim reads the lock list and leaves the store SDKs unrenamed")
 
     step("What the artifact gives away")
     key = cfg.key()
@@ -914,7 +919,7 @@ def obfuscate(cfg: config_lib.Config, regenerate: bool = False, check: bool = Fa
     if not check:
         gdmaim_lib.install(root, cfg.local.get("gdmaim_src"))
         gdmaim_lib.enable_plugin(root)
-        gdmaim_lib.write_settings(root)
+        gdmaim_lib.write_settings(root, _unobfuscated(cfg))
         _script_export_mode(root, 0)
         _exclude_gdmaim(root)
         _turn_on(cfg)
@@ -936,7 +941,26 @@ def obfuscate(cfg: config_lib.Config, regenerate: bool = False, check: bool = Fa
         ok(f"{len(needed)} string-reached symbols, all locked")
     if stale:
         warn(f"the lock list keeps {len(stale)} name(s) nothing reaches by string any more")
+    if check:
+        # The scan above reads the lock list; GDMaim reads it only behind a flag.
+        # A build that passes the scan with the flag off ships every locked name
+        # renamed -- the exact build this check exists to stop.
+        for what in gdmaim_lib.review(root, _unobfuscated(cfg)):
+            fail(what)
     return 1 if failures else 0
+
+
+def _unobfuscated(cfg: config_lib.Config) -> list[str]:
+    """Folders GDMaim leaves alone: what the project lists, plus every store SDK
+    a variant installs -- the game reaches those by string and the platform's
+    JavaScript by name, and neither survives a rename."""
+    folders = [str(p) for p in cfg["obfuscation"].get("exclude", [])]
+    for variant in cfg.variants():
+        if variant.addon and variant.addon in ADDONS:
+            folder = ADDONS[variant.addon].ADDON
+            if folder not in folders:
+                folders.append(folder)
+    return folders
 
 
 def _turn_on(cfg: config_lib.Config) -> None:
@@ -1300,8 +1324,13 @@ def _starter(version: str, seen: list[str], hygiene: list[str], required: list,
         '#       autoloads: ["Bridge"]',
         '#       plugins: ["res://addons/playgama_bridge/plugin.cfg"]',
         "#",
-        "# Where to look for symbols reached by string, when obfuscating. Default: all.",
-        '# obfuscation: {scan: ["src", "addons/weather"]}',
+        "# Obfuscation: where to look for symbols reached by string (default: everywhere),",
+        "# and what GDMaim must leave alone -- a folder the game reaches by string and",
+        "# the platform's JavaScript by name, so a rename breaks it silently. Every",
+        "# store SDK a variant installs is excluded without being listed here.",
+        "# obfuscation:",
+        '#   scan: ["src", "addons/weather"]',
+        '#   exclude: ["addons/vendored_sdk"]',
         "#",
         "# Where the pack key lives, if not .keys/dev.gdkey.",
         '# key: ".keys/dev.gdkey"',
@@ -1519,6 +1548,9 @@ def main() -> int:
     p.add_argument("target", nargs="?", help="a web target or variant (default: web)")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--dir")
+    p.add_argument("--plain", action="store_true",
+                   help="no cross-origin isolation headers: for a store's QA tool, whose "
+                        "SDK and ad scripts those headers block (thread-less exports only)")
 
     p = sub.add_parser("audit", help="what is actually inside the pack")
     p.add_argument("target", nargs="?", default=None)
@@ -1568,7 +1600,7 @@ def main() -> int:
         if not args.dir and not target:
             raise SystemExit(f"no web target in {config_lib.TRACKED} -- name one, or pass --dir")
         folder = Path(args.dir) if args.dir else artifact_path(cfg, target).parent
-        return serve_lib.serve(folder, args.port)
+        return serve_lib.serve(folder, args.port, isolate=not args.plain)
     if args.command == "audit":
         target = args.target or _web_target(cfg) or cfg.targets[0]
         return run_audit(cfg, target, args.all, args.check)

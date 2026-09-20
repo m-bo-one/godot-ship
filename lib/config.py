@@ -61,7 +61,9 @@ DEFAULTS = {
     "encrypt": {},
     "obfuscate": False,
     # Where to look for symbols reached by string. "." is the whole project.
-    "obfuscation": {"scan": ["."]},
+    # `exclude` names folders GDMaim must leave alone (their symbols stay locked
+    # everywhere); every variant's store addon is added to it without being listed.
+    "obfuscation": {"scan": ["."], "exclude": []},
     "key": ".keys/dev.gdkey",
     "boot": {
         "target": "windows",

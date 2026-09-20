@@ -45,7 +45,12 @@ SETTINGS = {
         # operator into `+0.15`, which GDScript reads as a signed literal, and
         # the script fails to parse at run time. It saves nothing besides.
         "strip_extraneous_spacing": "false",
-        "strip_editor_annotations": "true",
+        # Stripping @export makes an inherited scene lose every typed node
+        # reference its base scene set (`visual = NodePath(...)` on a child
+        # scene resolves against the annotation), so the child starts with
+        # null exports and its _ready dies. Found on a lucky block that
+        # inherits a block; the annotations cost nothing in the pack.
+        "strip_editor_annotations": "false",
         "strip_static_typing": "false",
         "striped_static_typing_be_initialized": "true",
         "regex_filter_enabled": "false",
@@ -68,7 +73,35 @@ SETTINGS = {
         # check the linkage after an upgrade, `ship.py obfuscate --check`.
         "inject_name": "false",
     },
+    "exclude_files_category": {
+        # The lock list is read ONLY behind this flag. Off, ignore_tokens.txt is a
+        # file nobody opens, and every string-reached symbol ships renamed while
+        # the scan reports them all locked. Found on a Bridge build whose game
+        # never called the SDK once.
+        "custom_tokens_enabled": "true",
+        # `multi_filepath` is written per call from `exclude_paths()`.
+    },
 }
+
+EXCLUDE_SECTION = "exclude_files_category"
+EXCLUDE_KEY = "multi_filepath"
+
+
+def exclude_paths(folders: list[str]) -> str:
+    """The `;`-joined res:// list GDMaim's exclusion field holds.
+
+    A store SDK addon is reached from two sides GDMaim cannot see: the game
+    names its members in strings (`call("set_score")`, `get("platform")`) and
+    the platform's JavaScript names them from outside the pack. Renaming any of
+    them breaks the SDK silently, so the whole folder is excluded; GDMaim then
+    locks every symbol those scripts declare, project-wide.
+    """
+    seen: list[str] = []
+    for folder in folders:
+        clean = folder.strip().replace("\\", "/").removeprefix("res://").strip("/")
+        if clean and clean not in seen:
+            seen.append(clean)
+    return ";".join(f"res://{folder}/" for folder in seen)
 
 # Either `obj.call("x")` or a bare `call("x")` on self -- the bare form is the
 # common one inside the class that declares the method, and requiring the dot
@@ -149,17 +182,101 @@ def enable_plugin(root: Path) -> None:
     print("  plugin enabled in project.godot")
 
 
-def write_settings(root: Path) -> None:
+def write_settings(root: Path, exclude: list[str] | None = None) -> None:
+    """The settled settings into both files, and the exclusion list into them.
+
+    The list written is the union of what the config asks for and what the
+    file already held: a folder somebody excluded by hand in the editor -- a
+    vendored library reached by string -- is not on the tracked list, and
+    replacing the field would drop it without a word on the next
+    `ship.py obfuscate`, which is a renamed symbol found only in the exported
+    build. What was kept from the file is printed, so it can be moved into
+    `obfuscation.exclude` where it belongs.
+    """
+    wanted = exclude_paths(exclude or [])
+    kept = [p for p in _excluded_now(root) if p not in wanted.split(";")]
+    joined = ";".join(part for part in [wanted, *kept] if part)
+    settings = {section: dict(values) for section, values in SETTINGS.items()}
+    settings[EXCLUDE_SECTION][EXCLUDE_KEY] = f'"{joined}"'
     for name in CONFIG_FILES:
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         existing = path.read_text(encoding="utf-8") if path.is_file() else ""
-        path.write_text(_merged(existing), encoding="utf-8")
+        path.write_text(_merged(existing, settings), encoding="utf-8")
     print(f"  settings written to {' and '.join(CONFIG_FILES)}")
+    if exclude:
+        print(f"  left unobfuscated: {', '.join(exclude)}")
+    if kept:
+        print(f"  kept from the file, not in obfuscation.exclude: {', '.join(kept)}")
 
 
-def _merged(existing: str) -> str:
+def _excluded_now(root: Path) -> list[str]:
+    """Every res:// path the files' `multi_filepath` holds today, in order."""
+    found: list[str] = []
+    for name in CONFIG_FILES:
+        path = root / name
+        if not path.is_file():
+            continue
+        section = ""
+        for line in path.read_text(encoding="utf-8").splitlines():
+            header = re.match(r"^\[(\w+)\]$", line.strip())
+            if header:
+                section = header.group(1)
+                continue
+            key = re.match(rf"^{EXCLUDE_KEY}=(.*)$", line.strip())
+            if section == EXCLUDE_SECTION and key:
+                for part in key.group(1).strip().strip('"').split(";"):
+                    if part.strip() and part.strip() not in found:
+                        found.append(part.strip())
+    return found
+
+
+def review(root: Path, exclude: list[str]) -> list[str]:
+    """What is wrong with the GDMaim config on disk, in sentences.
+
+    Both files are read because GDMaim reads them in order and the second wins
+    for a key the first lacks; a value fixed in one of them is still the old
+    value if the other one carries it too.
+    """
+    wanted = exclude_paths(exclude)
+    remarks: list[str] = []
+    for name in CONFIG_FILES:
+        path = root / name
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        section = ""
+        flag = ""
+        paths = ""
+        for line in text.splitlines():
+            header = re.match(r"^\[(\w+)\]$", line.strip())
+            if header:
+                section = header.group(1)
+                continue
+            if section != EXCLUDE_SECTION:
+                continue
+            key = re.match(r"^(\w+)=(.*)$", line.strip())
+            if not key:
+                continue
+            if key.group(1) == "custom_tokens_enabled":
+                flag = key.group(2).strip()
+            elif key.group(1) == EXCLUDE_KEY:
+                paths = key.group(2).strip().strip('"')
+        if flag != "true":
+            remarks.append(f"{name}: custom_tokens_enabled is {flag or 'unset'} -- the lock list "
+                           "is never read and every string-reached symbol ships renamed. "
+                           "Run: ship.py obfuscate")
+        missing = [p for p in wanted.split(";") if p and p not in paths.split(";")]
+        if missing:
+            remarks.append(f"{name}: not excluded from obfuscation: {', '.join(missing)} -- a "
+                           "store SDK the game reaches by string is renamed out from under it. "
+                           "Run: ship.py obfuscate")
+    return remarks
+
+
+def _merged(existing: str, settings: dict[str, dict[str, str]] | None = None) -> str:
     """Keep whatever the addon put there, override only what is settled."""
+    table = settings or SETTINGS
     out: list[str] = []
     seen: dict[str, set[str]] = {}
     section = ""
@@ -171,13 +288,13 @@ def _merged(existing: str) -> str:
             out.append(line)
             continue
         key = re.match(r"^(\w+)=", line.strip())
-        if key and section in SETTINGS and key.group(1) in SETTINGS[section]:
+        if key and section in table and key.group(1) in table[section]:
             name = key.group(1)
             seen[section].add(name)
-            out.append(f"{name}={SETTINGS[section][name]}")
+            out.append(f"{name}={table[section][name]}")
             continue
         out.append(line)
-    for section, values in SETTINGS.items():
+    for section, values in table.items():
         missing = {k: v for k, v in values.items() if k not in seen.get(section, set())}
         if not missing:
             continue
