@@ -26,6 +26,33 @@ PLUGIN = "res://addons/gdmaim/plugin.cfg"
 # GDMaim reads .gdmaim/export.cfg BEFORE addons/gdmaim/export.cfg and writes
 # both, so a value set in only one of them is silently the old value.
 CONFIG_FILES = [".gdmaim/export.cfg", "addons/gdmaim/export.cfg"]
+# The lock list GDMaim reads when the project keeps one of its own; without it,
+# the one inside the addon (LEGACY_LOCKS).
+PROJECT_LOCKS = ".gdmaim/ignore_tokens.txt"
+LEGACY_LOCKS = "addons/gdmaim/user/ignore_tokens.txt"
+
+
+def linked(root: Path) -> bool:
+    """True when addons/gdmaim is a link (a junction or a symlink) to a checkout that
+    other projects share: the export.cfg and lock list inside it are not this project's."""
+    folder = root / "addons/gdmaim"
+    return folder.is_symlink() or bool(getattr(folder, "is_junction", lambda: False)())
+
+
+def config_files(root: Path) -> list[str]:
+    """CONFIG_FILES this project owns: the addon's own export.cfg is left out when the
+    addon is linked in and the project keeps its lock list in .gdmaim/ (it is another
+    project's file then; GDMaim reads .gdmaim/export.cfg first anyway)."""
+    shared = linked(root) and (root / PROJECT_LOCKS).is_file()
+    return [name for name in CONFIG_FILES if not (name.startswith("addons/") and shared)]
+
+
+def lock_path(root: Path) -> Path:
+    """The project's own .gdmaim/ignore_tokens.txt when it has one (GDMaim reads that
+    one first), else the list inside the addon. Never chosen for a project that has
+    none: a project that tracks the list inside a linked addon keeps it there."""
+    own = root / PROJECT_LOCKS
+    return own if own.is_file() else root / LEGACY_LOCKS
 
 SETTINGS = {
     "obfuscator": {
@@ -198,12 +225,12 @@ def write_settings(root: Path, exclude: list[str] | None = None) -> None:
     joined = ";".join(part for part in [wanted, *kept] if part)
     settings = {section: dict(values) for section, values in SETTINGS.items()}
     settings[EXCLUDE_SECTION][EXCLUDE_KEY] = f'"{joined}"'
-    for name in CONFIG_FILES:
+    for name in config_files(root):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         existing = path.read_text(encoding="utf-8") if path.is_file() else ""
         path.write_text(_merged(existing, settings), encoding="utf-8")
-    print(f"  settings written to {' and '.join(CONFIG_FILES)}")
+    print(f"  settings written to {' and '.join(config_files(root))}")
     if exclude:
         print(f"  left unobfuscated: {', '.join(exclude)}")
     if kept:
@@ -213,7 +240,7 @@ def write_settings(root: Path, exclude: list[str] | None = None) -> None:
 def _excluded_now(root: Path) -> list[str]:
     """Every res:// path the files' `multi_filepath` holds today, in order."""
     found: list[str] = []
-    for name in CONFIG_FILES:
+    for name in config_files(root):
         path = root / name
         if not path.is_file():
             continue
@@ -240,7 +267,7 @@ def review(root: Path, exclude: list[str]) -> list[str]:
     """
     wanted = exclude_paths(exclude)
     remarks: list[str] = []
-    for name in CONFIG_FILES:
+    for name in config_files(root):
         path = root / name
         if not path.is_file():
             continue
@@ -354,7 +381,7 @@ def locks(root: Path, folders: list[str]) -> tuple[list[str], list[str], list[st
 
 
 def _lock_lines(root: Path) -> list[str]:
-    path = root / "addons/gdmaim/user/ignore_tokens.txt"
+    path = lock_path(root)
     return path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
 
 
@@ -381,7 +408,7 @@ def read_locks(root: Path) -> list[str]:
 def write_locks(root: Path, needed: list[str]) -> Path:
     """The scan's names, then the manual block verbatim. Dropping that block was how a
     hand-locked name vanished on the next regeneration and broke only the exported build."""
-    path = root / "addons/gdmaim/user/ignore_tokens.txt"
+    path = lock_path(root)
     kept = manual_block(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     header = "\n".join([
